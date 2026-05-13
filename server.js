@@ -1488,6 +1488,8 @@ app.delete("/api/memories/:id/permanent", requireFrontendAuth, async (req, res) 
     if (!isValidUuid(id)) return res.status(400).json({ error: "Invalid id" });
     const existing = await readMemoryById(id);
     if (!existing) return res.status(404).json({ error: "Not found" });
+    const existingRaw = ensureObject(existing.raw, {});
+    if (existingRaw._archived !== true) return res.status(409).json({ error: "Only archived memories can be permanently deleted" });
     const client = getSupabaseClient();
     const { error } = await client.from(MEMORY_TABLE).delete().eq("id", id);
     if (error) throw toDbError("Supabase permanent delete failed", error);
