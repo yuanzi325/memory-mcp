@@ -446,7 +446,7 @@ async function readMemoryByLegacyId(legacyId) {
   return data || null;
 }
 
-async function readMemoryRows({ layer, sub_layer, limit = 10 } = {}) {
+async function readMemoryRows({ layer, sub_layer, limit = 10, offset = 0 } = {}) {
   const client = getSupabaseClient();
   let query = client
     .from(MEMORY_TABLE)
@@ -456,8 +456,9 @@ async function readMemoryRows({ layer, sub_layer, limit = 10 } = {}) {
     .order("date", { ascending: false, nullsFirst: false });
   if (layer) query = query.eq("layer", layer);
   if (sub_layer) query = query.eq("sub_layer", sub_layer);
-  const cap = Math.max(1, Math.min(200, Number(limit) || 10));
-  query = query.limit(cap);
+  const cap = Math.max(1, Math.min(2000, Number(limit) || 10));
+  const off = Math.max(0, Number(offset) || 0);
+  query = query.range(off, off + cap - 1);
   const { data, error } = await query;
   if (error) throw toDbError("Supabase readMemoryRows failed", error);
   return ensureArray(data);
@@ -523,7 +524,7 @@ async function queryMemoryRows({
 
   // Fetch with headroom so JS-side raw->_archived/_resolved filters can still
   // satisfy `limit` after dropping a few rows.
-  const cap = Math.max(1, Math.min(200, (Number(limit) || 10) * 3));
+  const cap = Math.max(1, Math.min(2000, (Number(limit) || 10) * 3));
   query = query.limit(cap);
 
   const { data, error } = await query;
@@ -1374,20 +1375,24 @@ app.options("/api/memories/:id/restore", (req, res) => res.sendStatus(204));
 app.get("/api/memories", requireFrontendAuth, async (req, res) => {
   try {
     const { layer, sub_layer, q } = req.query;
-    const limit = Math.max(1, Math.min(200, Number(req.query.limit) || 50));
+    const limit = Math.max(1, Math.min(2000, Number(req.query.limit) || 50));
+    const offset = Math.max(0, Number(req.query.offset) || 0);
     const includeArchived = req.query.include_archived === "true" || req.query.include_archived === "1";
-    const fetchLimit = limit * 3;
+    // Fetch one extra row as a canary to detect whether more pages exist.
+    // For include_archived queries fetchLimit = limit+1; for visible-only queries over-fetch x3.
+    const fetchLimit = includeArchived ? limit + 1 : limit * 3;
     let rows;
     if (q && String(q).trim()) {
       rows = await queryMemoryRows({ q, layer, sub_layer, limit: fetchLimit });
     } else {
-      rows = await readMemoryRows({ layer, sub_layer, limit: fetchLimit });
+      rows = await readMemoryRows({ layer, sub_layer, limit: fetchLimit, offset });
     }
     let items = rows.map(denormalizeMemoryRow).filter(Boolean);
     if (!includeArchived) items = items.filter((m) => !m._archived);
+    const has_more = items.length > limit;
     items = items.slice(0, limit);
-    log("info", "api", { route: "GET /api/memories", returned: items.length });
-    res.json({ items, total: items.length });
+    log("info", "api", { route: "GET /api/memories", returned: items.length, offset });
+    res.json({ items, total: items.length, has_more });
   } catch (err) {
     log("error", "api", { route: "GET /api/memories", message: err instanceof Error ? err.message : String(err) });
     res.status(500).json({ error: "Failed to read memories" });
