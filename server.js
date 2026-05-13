@@ -1416,12 +1416,24 @@ app.post("/api/memories", requireFrontendAuth, async (req, res) => {
   try {
     const row = buildMemoryRow(req.body);
     let saved;
+    let mode;
     if (row.id) {
       saved = await upsertMemoryRow(row);
+      mode = "upsert_by_id";
+    } else if (row.legacy_id) {
+      const existing = await readMemoryByLegacyId(row.legacy_id);
+      if (existing?.id) {
+        saved = await updateMemoryRowById(existing.id, row);
+        mode = "update_by_legacy_id";
+      } else {
+        saved = await insertMemoryRow(row);
+        mode = "insert";
+      }
     } else {
       saved = await insertMemoryRow(row);
+      mode = "insert";
     }
-    log("info", "api", { route: "POST /api/memories", id: saved?.id });
+    log("info", "api", { route: "POST /api/memories", id: saved?.id, mode });
     res.status(201).json(denormalizeMemoryRow(saved));
   } catch (err) {
     log("error", "api", { route: "POST /api/memories", message: err instanceof Error ? err.message : String(err) });
