@@ -1371,6 +1371,7 @@ app.use("/api", (req, res, next) => { setCORSHeaders(req, res); next(); });
 app.options("/api/memories", (req, res) => res.sendStatus(204));
 app.options("/api/memories/:id", (req, res) => res.sendStatus(204));
 app.options("/api/memories/:id/restore", (req, res) => res.sendStatus(204));
+app.options("/api/memories/:id/permanent", (req, res) => res.sendStatus(204));
 
 app.get("/api/memories", requireFrontendAuth, async (req, res) => {
   try {
@@ -1478,6 +1479,23 @@ app.delete("/api/memories/:id", requireFrontendAuth, async (req, res) => {
   } catch (err) {
     log("error", "api", { route: "DELETE /api/memories/:id", message: err instanceof Error ? err.message : String(err) });
     res.status(500).json({ error: "Failed to archive memory" });
+  }
+});
+
+app.delete("/api/memories/:id/permanent", requireFrontendAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!isValidUuid(id)) return res.status(400).json({ error: "Invalid id" });
+    const existing = await readMemoryById(id);
+    if (!existing) return res.status(404).json({ error: "Not found" });
+    const client = getSupabaseClient();
+    const { error } = await client.from(MEMORY_TABLE).delete().eq("id", id);
+    if (error) throw toDbError("Supabase permanent delete failed", error);
+    log("info", "api", { route: "DELETE /api/memories/:id/permanent", id });
+    res.json({ ok: true, id });
+  } catch (err) {
+    log("error", "api", { route: "DELETE /api/memories/:id/permanent", message: err instanceof Error ? err.message : String(err) });
+    res.status(500).json({ error: "Failed to permanently delete memory" });
   }
 });
 
