@@ -1392,7 +1392,7 @@ app.get("/api/memories", requireFrontendAuth, async (req, res) => {
     const has_more = items.length > limit;
     items = items.slice(0, limit);
     log("info", "api", { route: "GET /api/memories", returned: items.length, offset });
-    res.json({ items, total: items.length, has_more });
+    res.json({ items, count: items.length, has_more });
   } catch (err) {
     log("error", "api", { route: "GET /api/memories", message: err instanceof Error ? err.message : String(err) });
     res.status(500).json({ error: "Failed to read memories" });
