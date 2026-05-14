@@ -280,10 +280,30 @@ function clampNumber(value, min, max, fallback) {
 
 function splitKeywords(value) {
   if (Array.isArray(value)) {
-    return value
-      .slice(0, KEYWORDS_MAX)
-      .map((item) => safeString(item, STR_LIMITS.keyword).trim())
-      .filter(Boolean);
+    const expanded = [];
+    for (const item of value) {
+      const s = String(item ?? "").trim();
+      // Detect element that is itself a JSON-stringified array
+      if (s.startsWith("[")) {
+        try {
+          const parsed = JSON.parse(s);
+          if (Array.isArray(parsed)) {
+            for (const inner of parsed) {
+              const t = String(inner ?? "").trim();
+              if (t) expanded.push(t);
+            }
+            continue;
+          }
+        } catch (_) {}
+      }
+      if (s) expanded.push(s);
+    }
+    return [...new Set(
+      expanded
+        .slice(0, KEYWORDS_MAX)
+        .map((item) => safeString(item, STR_LIMITS.keyword).trim())
+        .filter(Boolean)
+    )];
   }
   if (typeof value === "string") {
     return value
