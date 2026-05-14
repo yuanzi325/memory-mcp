@@ -391,6 +391,11 @@ function denormalizeMemoryRow(row) {
     mood: row.mood ?? "",
     keywords: ensureArray(row.keywords),
     profiles: ensureArray(row.profiles),
+    name: row.name ?? raw.name ?? "",
+    domain: ensureArray(row.domain ?? raw.domain),
+    tags: ensureArray(row.tags ?? raw.tags),
+    bucket_id: row.bucket_id ?? raw.bucket_id ?? "",
+    bucket_type: row.bucket_type ?? raw.bucket_type ?? "",
     why_precious: typeof raw.why_precious === "string" ? raw.why_precious : "",
     today_snapshot: typeof raw.today_snapshot === "string" ? raw.today_snapshot : "",
     resolved: raw.resolved ?? row.resolved ?? false,
@@ -593,7 +598,8 @@ async function touchMemoryRow(id) {
     if (error || !row) return;
     const raw = ensureObject(row.raw, {});
     const currentCount = raw.activation_count ?? row.activation_count ?? 0;
-    const nextCount = Number(currentCount) + 1;
+    const numericCount = Number(currentCount);
+    const nextCount = Number.isFinite(numericCount) ? numericCount + 1 : 1;
     const now = new Date().toISOString();
     await client
       .from(MEMORY_TABLE)
@@ -1213,6 +1219,11 @@ function createServer() {
             importance: z.number(),
             profiles: z.array(z.string()),
             keywords: z.array(z.string()),
+            name: z.string(),
+            domain: z.array(z.string()),
+            tags: z.array(z.string()),
+            bucket_id: z.string(),
+            bucket_type: z.string(),
             date: z.string(),
             score: z.number(),
             pinned: z.boolean(),
@@ -1246,15 +1257,18 @@ function createServer() {
       function computeScore(m) {
         let s = calculateSurfaceScore(m);
         if (hasQuery) {
-          const raw = ensureObject(m.raw, {});
           const title = String(m.title || "").toLowerCase();
+          const name = String(m.name || "").toLowerCase();
           const kws = ensureArray(m.keywords).map((k) => String(k).toLowerCase());
-          const tags = ensureArray(raw.tags).map((k) => String(k).toLowerCase());
-          const name = String(raw.name || "").toLowerCase();
-          const domain = String(raw.domain || "").toLowerCase();
+          const tags = ensureArray(m.tags).map((k) => String(k).toLowerCase());
+          const domain = ensureArray(m.domain).map((d) => String(d).toLowerCase());
           const content = String(m.content || "").toLowerCase();
           if (title.includes(ql) || name.includes(ql)) s *= 2.5;
-          else if (kws.some((k) => k.includes(ql)) || tags.some((k) => k.includes(ql)) || domain.includes(ql)) s *= 1.8;
+          else if (
+            kws.some((k) => k.includes(ql)) ||
+            tags.some((k) => k.includes(ql)) ||
+            domain.some((d) => d.includes(ql))
+          ) s *= 1.8;
           else if (content.includes(ql)) s *= 1.2;
         }
         return Math.round(s * 10000) / 10000;
@@ -1262,7 +1276,18 @@ function createServer() {
 
       let rows;
       if (hasQuery) {
-        rows = await queryMemoryRows({ q, layer, sub_layer, limit: Math.min(300, cap * 10) });
+        const [queryRows, recentRows] = await Promise.all([
+          queryMemoryRows({ q, layer, sub_layer, limit: Math.min(300, cap * 10) }),
+          readMemoryRows({ layer, sub_layer, limit: 300 }),
+        ]);
+        const seen = new Set();
+        rows = [];
+        for (const r of [...queryRows, ...recentRows]) {
+          if (r?.id && !seen.has(r.id)) {
+            seen.add(r.id);
+            rows.push(r);
+          }
+        }
       } else {
         rows = await readMemoryRows({ layer, sub_layer, limit: 300 });
       }
@@ -1300,6 +1325,11 @@ function createServer() {
         importance: typeof m.importance === "number" ? m.importance : 0,
         profiles: ensureArray(m.profiles),
         keywords: ensureArray(m.keywords),
+        name: m.name ?? "",
+        domain: ensureArray(m.domain),
+        tags: ensureArray(m.tags),
+        bucket_id: m.bucket_id ?? "",
+        bucket_type: m.bucket_type ?? "",
         date: m.date ?? "",
         score,
         pinned: Boolean(m.pinned),
