@@ -2025,25 +2025,35 @@ function createServer() {
       let rawCandidates = [];
 
       if (source_ids && source_ids.length > 0) {
+        // Explicit IDs — fetch exactly those
         const fetched = await Promise.all(
           source_ids.map((id) => isValidUuid(id) ? readMemoryById(id) : Promise.resolve(null))
         );
         rawCandidates = fetched.filter(Boolean).map(denormalizeMemoryRow).filter(Boolean);
-      } else {
-        const [queryRows, recentRows] = await Promise.all([
-          q ? queryMemoryRows({ q, layer, sub_layer, limit: limit * 3 }) : Promise.resolve([]),
-          readMemoryRows({ layer, sub_layer, limit: limit * 3 }),
-        ]);
+      } else if (q && String(q).trim()) {
+        // Query-only — no recent fallback; q miss means sources=[]
+        const queryRows = await queryMemoryRows({ q, layer, sub_layer, limit: limit * 3 });
         const seen = new Set();
-        const merged = [];
-        for (const r of [...queryRows, ...recentRows]) {
+        for (const r of queryRows) {
           if (r?.id && !seen.has(r.id)) {
             seen.add(r.id);
             const den = denormalizeMemoryRow(r);
-            if (den) merged.push(den);
+            if (den) rawCandidates.push(den);
           }
         }
-        rawCandidates = merged.filter((m) => matchesProfileFilter(m, profile)).slice(0, limit * 2);
+        rawCandidates = rawCandidates.filter((m) => matchesProfileFilter(m, profile)).slice(0, limit * 2);
+      } else {
+        // No source_ids, no q — browse recent rows
+        const recentRows = await readMemoryRows({ layer, sub_layer, limit: limit * 3 });
+        const seen = new Set();
+        for (const r of recentRows) {
+          if (r?.id && !seen.has(r.id)) {
+            seen.add(r.id);
+            const den = denormalizeMemoryRow(r);
+            if (den) rawCandidates.push(den);
+          }
+        }
+        rawCandidates = rawCandidates.filter((m) => matchesProfileFilter(m, profile)).slice(0, limit * 2);
       }
 
       // 2. Filter: skip archived, resolved, pinned, protected
@@ -2076,6 +2086,21 @@ function createServer() {
             skipped_reasons: skipped,
           },
           `[preview] ${sources.length} 条来源候选，${skipped.length} 条跳过。dry_run=true，未写入。source_ids=${resultSourceIds.join(", ") || "(无)"}`
+        );
+      }
+
+      // Apply safety gate: dry_run=false requires explicit source_ids
+      if (!source_ids || source_ids.length === 0) {
+        return makeResult(
+          {
+            mode: "preview",
+            sources,
+            source_ids: resultSourceIds,
+            digested_count: 0,
+            skipped_count: skipped.length,
+            skipped_reasons: skipped,
+          },
+          "dry_run=false requires explicit source_ids. Please run dry_run=true first and pass confirmed source_ids."
         );
       }
 
