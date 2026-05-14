@@ -731,6 +731,25 @@ function matchesProfileFilter(memory, profileFilter) {
   return effective.includes("shared");
 }
 
+function memoryTextMatch(memory, q) {
+  const ql = String(q || "").trim().toLowerCase();
+  if (!ql) return true;
+  const title = String(memory.title || "").toLowerCase();
+  const name = String(memory.name || "").toLowerCase();
+  const keywords = ensureArray(memory.keywords).map((v) => String(v).toLowerCase());
+  const tags = ensureArray(memory.tags).map((v) => String(v).toLowerCase());
+  const domain = ensureArray(memory.domain).map((v) => String(v).toLowerCase());
+  const content = String(memory.content || "").toLowerCase();
+  return (
+    title.includes(ql) ||
+    name.includes(ql) ||
+    keywords.some((v) => v.includes(ql)) ||
+    tags.some((v) => v.includes(ql)) ||
+    domain.some((v) => v.includes(ql)) ||
+    content.includes(ql)
+  );
+}
+
 // ── vault_briefing helpers ────────────────────────────────────────────────────
 
 async function readVaultState() {
@@ -1211,6 +1230,7 @@ function createServer() {
         include_archived: z.boolean().optional().default(false),
         touch: z.boolean().optional().default(true),
         snippet_length: z.number().int().min(0).optional().default(1200),
+        strict_q: z.boolean().optional().default(false),
       }),
       outputSchema: z.object({
         items: z.array(
@@ -1240,6 +1260,7 @@ function createServer() {
         returned_count: z.number(),
         total_memories: z.number(),
         touched: z.boolean(),
+        mode: z.string(),
         generated_at: z.string(),
       }),
     },
@@ -1253,6 +1274,7 @@ function createServer() {
       include_archived = false,
       touch = true,
       snippet_length = 1200,
+      strict_q = false,
     }) => {
       const cap = Math.max(1, Math.min(30, Number(limit) || 10));
       const hasQuery = Boolean(q && String(q).trim());
@@ -1300,6 +1322,9 @@ function createServer() {
       if (!include_archived) memories = memories.filter((m) => !m._archived);
       if (!include_resolved) memories = memories.filter((m) => !m.resolved);
       memories = memories.filter((m) => matchesProfileFilter(m, profile));
+      if (hasQuery && strict_q) {
+        memories = memories.filter((m) => memoryTextMatch(m, q));
+      }
 
       const scored = memories.map((m) => ({ m, score: computeScore(m) }));
       scored.sort((a, b) => b.score - a.score);
@@ -1343,18 +1368,21 @@ function createServer() {
         last_active: m.last_active ?? "",
       }));
 
+      const mode = strict_q ? "query_strict" : (hasQuery ? "query_biased" : "surface");
+
       const result = {
         items: structuredItems,
         returned_count: structuredItems.length,
         total_memories: total,
         touched: touch && top.length > 0,
+        mode,
         generated_at: new Date().toISOString(),
       };
 
       log("info", "tool", {
         tool: "memory_surface",
-        args: { q, profile, layer, sub_layer, limit, include_resolved, include_archived, touch },
-        result: { returned_count: result.returned_count, total_memories: result.total_memories },
+        args: { q, profile, layer, sub_layer, limit, include_resolved, include_archived, touch, strict_q },
+        result: { returned_count: result.returned_count, total_memories: result.total_memories, mode },
       });
 
       const blocks = top.length
@@ -1364,11 +1392,11 @@ function createServer() {
                 `【${i + 1}/${top.length}】score=${score}\n${formatMemoryForModel(m, snippet_length)}`
             )
             .join("\n\n---\n\n")
-        : "没有浮现任何记忆。";
+        : strict_q ? `没有找到匹配 "${q}" 的记忆。` : "没有浮现任何记忆。";
 
       return makeResult(
         result,
-        `记忆浮现完成，共返回 ${result.returned_count} 条（总数 ${result.total_memories}）：\n\n${blocks}`
+        `记忆浮现完成（mode=${mode}），共返回 ${result.returned_count} 条（总数 ${result.total_memories}）：\n\n${blocks}`
       );
     }
   );
