@@ -1564,7 +1564,7 @@ function createServer() {
         });
         return makeResult(
           { mode: "created", item, similarity: 0, considered_count: 0 },
-          `已创建新记忆（merge=false）：${makeMemorySummary(item)}`
+          `[created] id=${item?.id} | title=${item?.title || "(无)"} | similarity=0 | pinned=${item?.pinned} protected=${item?.protected} resolved=${item?.resolved} _archived=${item?._archived}`
         );
       }
 
@@ -1621,7 +1621,7 @@ function createServer() {
         });
         return makeResult(
           { mode: "created", item, similarity: best?.score ?? 0, considered_count: eligible.length },
-          `未找到足够相似的旧记忆（最高相似度 ${best?.score ?? 0}，阈值 ${threshold}），已创建新记忆：${makeMemorySummary(item)}`
+          `[created] id=${item?.id} | title=${item?.title || "(无)"} | similarity=${best?.score ?? 0} | pinned=${item?.pinned} protected=${item?.protected} resolved=${item?.resolved} _archived=${item?._archived}`
         );
       }
 
@@ -1723,7 +1723,7 @@ function createServer() {
           similarity: best.score,
           considered_count: eligible.length,
         },
-        `已合并到旧记忆：${makeMemorySummary(item)}。相似度=${best.score}，阈值=${threshold}，追加 ${inputRow.content.length} 字，考虑了 ${eligible.length} 条候选。`
+        `[merged] id=${item?.id} | matched_id=${existing.id} | similarity=${best.score} threshold=${threshold} | appended=${inputRow.content.length}chars | pinned=${item?.pinned} protected=${item?.protected} resolved=${item?.resolved} _archived=${item?._archived}`
       );
     }
   );
