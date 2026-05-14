@@ -393,19 +393,22 @@ function denormalizeMemoryRow(row) {
     profiles: ensureArray(row.profiles),
     why_precious: typeof raw.why_precious === "string" ? raw.why_precious : "",
     today_snapshot: typeof raw.today_snapshot === "string" ? raw.today_snapshot : "",
-    resolved: Boolean(raw.resolved),
-    pinned: Boolean(raw.pinned),
-    protected: Boolean(raw.protected),
-    _archived: Boolean(raw._archived),
+    resolved: raw.resolved ?? row.resolved ?? false,
+    pinned: raw.pinned ?? row.pinned ?? false,
+    protected: raw.protected ?? row.protected ?? false,
+    _archived: Boolean(raw._archived ?? row._archived),
+    digested: raw.digested ?? row.digested ?? false,
     activation_count:
-      typeof raw.activation_count === "number" ? raw.activation_count : 0,
-    last_active: typeof raw.last_active === "string" ? raw.last_active : "",
+      raw.activation_count ?? row.activation_count ?? 0,
+    last_active: raw.last_active ?? row.last_active ?? "",
     created_at: row.created_at ?? "",
     updated_at: row.updated_at ?? "",
     raw,
   };
-  if (typeof raw.valence === "number") denormalized.valence = raw.valence;
-  if (typeof raw.arousal === "number") denormalized.arousal = raw.arousal;
+  const valence = raw.valence ?? row.valence;
+  const arousal = raw.arousal ?? row.arousal;
+  if (typeof valence === "number") denormalized.valence = valence;
+  if (typeof arousal === "number") denormalized.arousal = arousal;
   return denormalized;
 }
 
@@ -584,17 +587,21 @@ async function touchMemoryRow(id) {
     const client = getSupabaseClient();
     const { data: row, error } = await client
       .from(MEMORY_TABLE)
-      .select("raw")
+      .select("raw, activation_count, last_active")
       .eq("id", id)
       .maybeSingle();
     if (error || !row) return;
     const raw = ensureObject(row.raw, {});
-    const currentCount = typeof raw.activation_count === "number" ? raw.activation_count : 0;
+    const currentCount = raw.activation_count ?? row.activation_count ?? 0;
+    const nextCount = Number(currentCount) + 1;
+    const now = new Date().toISOString();
     await client
       .from(MEMORY_TABLE)
       .update({
-        raw: { ...raw, activation_count: currentCount + 1, last_active: new Date().toISOString() },
-        updated_at: new Date().toISOString(),
+        raw: { ...raw, activation_count: nextCount, last_active: now },
+        activation_count: nextCount,
+        last_active: now,
+        updated_at: now,
       })
       .eq("id", id);
   } catch (_) {}
@@ -694,20 +701,24 @@ function calcDecayScore(memory = {}) {
     Math.exp(-0.05 * daysSince) *
     emotionWeight;
 
-  if (memory.resolved) score *= 0.05;
+  if (memory.resolved && memory.digested) score *= 0.02;
+  else if (memory.resolved) score *= 0.05;
   if (arousal > 0.7 && !memory.resolved) score *= 1.5;
 
   return Math.round(score * 10000) / 10000;
 }
 
-const calculateSurfaceScore = calcDecayScore;
+function calculateSurfaceScore(memory = {}) {
+  return calcDecayScore(memory);
+}
 
 function matchesProfileFilter(memory, profileFilter) {
   const profiles = ensureArray(memory.profiles);
+  const effective = profiles.length ? profiles : ["shared"];
   if (profileFilter === "all") return true;
-  if (profileFilter === "rowan") return profiles.includes("shared") || profiles.includes("rowan");
-  if (profileFilter === "arion") return profiles.includes("shared") || profiles.includes("arion");
-  return profiles.includes("shared");
+  if (profileFilter === "rowan") return effective.includes("shared") || effective.includes("rowan");
+  if (profileFilter === "arion") return effective.includes("shared") || effective.includes("arion");
+  return effective.includes("shared");
 }
 
 // ── vault_briefing helpers ────────────────────────────────────────────────────
@@ -1235,11 +1246,15 @@ function createServer() {
       function computeScore(m) {
         let s = calculateSurfaceScore(m);
         if (hasQuery) {
+          const raw = ensureObject(m.raw, {});
           const title = String(m.title || "").toLowerCase();
           const kws = ensureArray(m.keywords).map((k) => String(k).toLowerCase());
+          const tags = ensureArray(raw.tags).map((k) => String(k).toLowerCase());
+          const name = String(raw.name || "").toLowerCase();
+          const domain = String(raw.domain || "").toLowerCase();
           const content = String(m.content || "").toLowerCase();
-          if (title.includes(ql)) s *= 2.5;
-          else if (kws.some((k) => k.includes(ql))) s *= 1.8;
+          if (title.includes(ql) || name.includes(ql)) s *= 2.5;
+          else if (kws.some((k) => k.includes(ql)) || tags.some((k) => k.includes(ql)) || domain.includes(ql)) s *= 1.8;
           else if (content.includes(ql)) s *= 1.2;
         }
         return Math.round(s * 10000) / 10000;
