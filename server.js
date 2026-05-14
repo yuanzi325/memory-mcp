@@ -259,6 +259,14 @@ function effectiveProfiles(value) {
   return profiles.length ? profiles : ["shared"];
 }
 
+function normalizeProfiles(value) {
+  if (Array.isArray(value)) return value.map((v) => String(v).trim()).filter(Boolean);
+  if (typeof value === "string") {
+    return value.split(/[，,、;；\n]/).map((v) => v.trim()).filter(Boolean);
+  }
+  return [];
+}
+
 function safeString(value, max) {
   const text = value == null ? "" : String(value);
   return text.length > max ? text.slice(0, max) : text;
@@ -2071,19 +2079,50 @@ function createServer() {
         );
       }
 
+      // Guard: no eligible sources → abort without writing
+      if (sources.length === 0) {
+        return makeResult(
+          {
+            mode: "preview",
+            sources: [],
+            source_ids: [],
+            digested_count: 0,
+            skipped_count: skipped.length,
+            skipped_reasons: skipped,
+          },
+          `[digest 中止] 没有符合条件的来源记忆（${skipped.length} 条被跳过），未写入。`
+        );
+      }
+
+      // Guard: content required — no auto-generated snippets
+      if (!content || !String(content).trim()) {
+        return makeResult(
+          {
+            mode: "preview",
+            sources,
+            source_ids: resultSourceIds,
+            digested_count: 0,
+            skipped_count: skipped.length,
+            skipped_reasons: skipped,
+          },
+          `[digest 中止] dry_run=false 时必须提供 content（调用方整理好的长期记忆内容），未写入。候选 ${sources.length} 条，请先 dry_run=true 确认来源再传入 content。`
+        );
+      }
+
       // 3. Build condensed memory
       const mergedKeywords = [
         ...new Set([
           ...sources.flatMap((m) => ensureArray(m.keywords)),
-          ...ensureArray(keywords),
+          ...splitKeywords(keywords),
         ]),
       ];
-      const mergedProfiles = [
+      const rawMergedProfiles = [
         ...new Set([
           ...sources.flatMap((m) => effectiveProfiles(m.profiles)),
-          ...effectiveProfiles(profiles),
+          ...normalizeProfiles(profiles),
         ]),
       ];
+      const mergedProfiles = rawMergedProfiles.length ? rawMergedProfiles : ["shared"];
       const sourceMaxImportance = sources.reduce(
         (max, m) => Math.max(max, Number(m.importance) || 0),
         0
@@ -2093,10 +2132,7 @@ function createServer() {
 
       const condensedRow = buildMemoryRow({
         title: title || `消化摘要 ${now.slice(0, 10)}`,
-        content: content ||
-          sources.map((m, i) =>
-            `${i + 1}. ${m.title || m.id}: ${String(m.content || "").slice(0, 200)}`
-          ).join("\n"),
+        content: String(content).trim(),
         layer: "memo",
         sub_layer,
         keywords: mergedKeywords,
