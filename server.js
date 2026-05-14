@@ -1698,8 +1698,14 @@ function createServer() {
             protected: Boolean(newRaw.protected),
             resolved: Boolean(newRaw.resolved ?? existing.resolved),
             digested: Boolean(newRaw.digested ?? existing.digested),
-            _archived: Boolean(newRaw._archived ?? existing._archived),
           })
+          .eq("id", existing.id);
+      } catch (_) {}
+      // _archived synced separately — column may not exist on all deployments
+      try {
+        await getSupabaseClient()
+          .from(MEMORY_TABLE)
+          .update({ _archived: Boolean(newRaw._archived ?? existing._archived) })
           .eq("id", existing.id);
       } catch (_) {}
 
