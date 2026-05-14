@@ -2614,8 +2614,8 @@ function createServer() {
       if (error) throw toDbError("memory_bucket_surface fetch failed", error);
 
       let memories = ensureArray(rows).map(denormalizeMemoryRow).filter(Boolean);
+      // Step 1: filter only by archived / profile / q — keep resolved for stats
       if (!include_archived) memories = memories.filter((m) => !m._archived);
-      if (!include_resolved) memories = memories.filter((m) => !m.resolved);
       memories = memories.filter((m) => matchesProfileFilter(m, profile));
       if (q && String(q).trim()) memories = memories.filter((m) => memoryTextMatch(m, q));
 
@@ -2640,8 +2640,10 @@ function createServer() {
       const results = [];
       for (const info of bucketMap.values()) {
         const all = info.all;
-        const open = all.filter((m) => !m.resolved && !m._archived);
-        const resolvedArr = all.filter((m) => m.resolved);
+        // open: not resolved, not digested, not archived
+        const open = all.filter((m) => !m.resolved && !m.digested && !m._archived);
+        // resolved: resolved OR digested
+        const resolvedArr = all.filter((m) => m.resolved || m.digested);
         const pinnedArr = all.filter((m) => m.pinned);
         const protectedArr = all.filter((m) => m.protected);
         const maxImportance = Math.max(...all.map((m) => Number(m.importance) || 0), 0);
@@ -2650,11 +2652,30 @@ function createServer() {
           if (!d) return best;
           return (!best || d > best) ? d : best;
         }, null);
+
+        // Score: always driven by open items; resolved get 0.1x weight only when include_resolved=true
         const openScores = open.map((m) => calcDecayScore(m)).sort((a, b) => b - a);
-        const bucketScore = openScores.slice(0, 3).reduce((s, v) => s + v, 0);
-        const sortedSamples = [...open]
-          .sort((a, b) => (Number(b.importance) || 0) - (Number(a.importance) || 0))
-          .slice(0, 3);
+        let bucketScore = openScores.slice(0, 3).reduce((s, v) => s + v, 0);
+        if (include_resolved && resolvedArr.length > 0) {
+          const resolvedBonus = resolvedArr
+            .map((m) => calcDecayScore(m) * 0.1)
+            .sort((a, b) => b - a)
+            .slice(0, 3)
+            .reduce((s, v) => s + v, 0);
+          bucketScore += resolvedBonus;
+        }
+
+        // Samples: open first; resolved only allowed when include_resolved=true
+        const openSorted = [...open].sort((a, b) => (Number(b.importance) || 0) - (Number(a.importance) || 0));
+        let samplePool;
+        if (include_resolved) {
+          const resolvedSorted = [...resolvedArr].sort((a, b) => (Number(b.importance) || 0) - (Number(a.importance) || 0));
+          samplePool = [...openSorted, ...resolvedSorted];
+        } else {
+          samplePool = openSorted;
+        }
+        const sortedSamples = samplePool.slice(0, 3);
+
         results.push({
           bucket_id: info.bucket_id,
           bucket_type: info.bucket_type,
@@ -2684,7 +2705,7 @@ function createServer() {
       });
 
       const lines = topResults.map((b, i) =>
-        `【${i + 1}】${b.name || b.bucket_id} (${b.bucket_type}) · 记忆数=${b.memory_count} open=${b.open_count} score=${b.score} · tags=[${b.tags.slice(0, 4).join(",")}]`
+        `【${i + 1}】${b.name || b.bucket_id} (${b.bucket_type}) · 记忆数=${b.memory_count} open=${b.open_count} resolved=${b.resolved_count} score=${b.score} · tags=[${b.tags.slice(0, 4).join(",")}]`
       );
       return makeResult(
         { buckets: topResults, returned_count: topResults.length, generated_at: new Date().toISOString() },
