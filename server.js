@@ -913,7 +913,9 @@ function inferBucketSeed(memory) {
 
 function scoreBucketMatch(memory, bucketCandidate) {
   let score = 0;
+  let hasSubjectHit = false;
 
+  // layer/sub_layer: bonus only, cannot trigger a match on their own
   const ml = String(memory.layer || "").toLowerCase();
   const bl = String(bucketCandidate.layer || "").toLowerCase();
   if (ml && bl && ml === bl) score += 0.20;
@@ -922,29 +924,45 @@ function scoreBucketMatch(memory, bucketCandidate) {
   const bs = String(bucketCandidate.sub_layer || "").toLowerCase().trim();
   if (ms && bs && ms === bs) score += 0.15;
 
+  // Subject hit 1: keywords intersection
   const mKws = new Set(ensureArray(memory.keywords).map((k) => String(k).toLowerCase()));
   const bKws = new Set(ensureArray(bucketCandidate.keywords).map((k) => String(k).toLowerCase()));
   if (mKws.size > 0 && bKws.size > 0) {
     const intersection = [...mKws].filter((k) => bKws.has(k)).length;
-    const union = new Set([...mKws, ...bKws]).size;
-    score += 0.40 * (intersection / union);
+    if (intersection > 0) {
+      hasSubjectHit = true;
+      const union = new Set([...mKws, ...bKws]).size;
+      score += 0.40 * (intersection / union);
+    }
   }
 
+  // Subject hit 2: title ↔ bucket name containment
   const mt = String(memory.title || "").toLowerCase().trim();
   const bn = String(bucketCandidate.name || "").toLowerCase().trim();
   if (mt && bn && mt.length > 1 && bn.length > 1) {
-    if (mt.includes(bn) || bn.includes(mt)) score += 0.10;
+    if (mt.includes(bn) || bn.includes(mt)) {
+      hasSubjectHit = true;
+      score += 0.10;
+    }
   }
 
+  // Subject hit 3: domain/tags intersection
   const mDomain = new Set(ensureArray(memory.domain).map((d) => String(d).toLowerCase()));
   const mTags = new Set(ensureArray(memory.tags).map((t) => String(t).toLowerCase()));
   const bDomain = ensureArray(bucketCandidate.domain).map((d) => String(d).toLowerCase());
   const bTags = ensureArray(bucketCandidate.tags).map((t) => String(t).toLowerCase());
   const domainHits = bDomain.filter((d) => mDomain.has(d)).length;
   const tagHits = bTags.filter((t) => mTags.has(t)).length;
-  const dtDenom = Math.max(bDomain.length + bTags.length, 1);
-  score += 0.10 * ((domainHits + tagHits) / dtDenom);
+  if (domainHits + tagHits > 0) {
+    hasSubjectHit = true;
+    const dtDenom = Math.max(bDomain.length + bTags.length, 1);
+    score += 0.10 * ((domainHits + tagHits) / dtDenom);
+  }
 
+  // Gate: no subject hit → no match
+  if (!hasSubjectHit) return 0;
+
+  // Recency bonus (cannot solo-trigger match)
   const la = parseDateLike(bucketCandidate.last_active);
   if (la) {
     const days = Math.max(0, (Date.now() - la.getTime()) / 86400000);
