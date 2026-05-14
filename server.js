@@ -1368,7 +1368,7 @@ function createServer() {
         last_active: m.last_active ?? "",
       }));
 
-      const mode = strict_q ? "query_strict" : (hasQuery ? "query_biased" : "surface");
+      const mode = hasQuery && strict_q ? "query_strict" : (hasQuery ? "query_biased" : "surface");
 
       const result = {
         items: structuredItems,
@@ -1392,7 +1392,7 @@ function createServer() {
                 `【${i + 1}/${top.length}】score=${score}\n${formatMemoryForModel(m, snippet_length)}`
             )
             .join("\n\n---\n\n")
-        : strict_q ? `没有找到匹配 "${q}" 的记忆。` : "没有浮现任何记忆。";
+        : hasQuery && strict_q ? `没有找到匹配 "${q}" 的记忆。` : "没有浮现任何记忆。";
 
       return makeResult(
         result,
