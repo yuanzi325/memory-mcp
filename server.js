@@ -1427,6 +1427,7 @@ function createServer() {
         id: z.string(),
         resolved: z.boolean().optional(),
         pinned: z.boolean().optional(),
+        protected: z.boolean().optional(),
         digested: z.boolean().optional(),
         importance: z.number().int().min(1).max(10).optional(),
         profiles: z.union([z.array(z.string()), z.string()]).optional(),
@@ -1445,6 +1446,7 @@ function createServer() {
       id,
       resolved,
       pinned,
+      protected: protectedFlag,
       digested,
       importance,
       profiles,
@@ -1477,11 +1479,15 @@ function createServer() {
 
       // state flags → raw
       if (resolved !== undefined) { newRaw.resolved = resolved; updatedFields.push("resolved"); }
+      if (protectedFlag !== undefined) { newRaw.protected = protectedFlag; updatedFields.push("protected"); }
       if (pinned !== undefined) {
         newRaw.pinned = pinned;
-        if (pinned) newRaw.protected = true;
+        // pinned=true overrides protected regardless of what protectedFlag says
+        if (pinned) {
+          newRaw.protected = true;
+          if (!updatedFields.includes("protected")) updatedFields.push("protected");
+        }
         updatedFields.push("pinned");
-        if (pinned) updatedFields.push("protected");
       }
       // digested is not in RAW_COMPAT_FIELDS — handle explicitly
       if (digested !== undefined) { newRaw.digested = digested; updatedFields.push("digested"); }
@@ -1508,6 +1514,9 @@ function createServer() {
       if (digested !== undefined) row.raw.digested = digested;
       if (action === "archive") row.raw._archived = true;
       if (action === "restore") row.raw._archived = false;
+      // pinned=true wins over any explicit protectedFlag
+      if (pinned === true) row.raw.protected = true;
+      else if (protectedFlag !== undefined) row.raw.protected = protectedFlag;
 
       const saved = await updateMemoryRowById(existing.id, row);
       const item = denormalizeMemoryRow(saved) ?? denormalizeMemoryRow({ ...row, id: existing.id });
@@ -1516,6 +1525,7 @@ function createServer() {
       try {
         const topLevel = {};
         if (resolved !== undefined) topLevel.resolved = resolved;
+        if (protectedFlag !== undefined) topLevel.protected = protectedFlag;
         if (pinned !== undefined) { topLevel.pinned = pinned; if (pinned) topLevel.protected = true; }
         if (digested !== undefined) topLevel.digested = digested;
         if (action === "archive") topLevel._archived = true;
@@ -1527,7 +1537,7 @@ function createServer() {
 
       log("info", "tool", {
         tool: "memory_trace",
-        args: { id: existing.id, action, resolved, pinned, digested, importance, updated_fields: updatedFields },
+        args: { id: existing.id, action, resolved, pinned, protected: protectedFlag, digested, importance, updated_fields: updatedFields },
         result: { item_id: item?.id, updated_at: item?.updated_at },
       });
 
