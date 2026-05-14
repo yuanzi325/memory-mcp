@@ -656,6 +656,20 @@ async function touchMemoryRow(id) {
   } catch (_) {}
 }
 
+async function readMemoryRowsByBucketId(bucketId, { limit = 500 } = {}) {
+  if (!bucketId) return [];
+  const client = getSupabaseClient();
+  const cap = Math.max(1, Math.min(2000, Number(limit) || 500));
+  const { data, error } = await client
+    .from(MEMORY_TABLE)
+    .select("*")
+    .eq("bucket_id", bucketId)
+    .order("updated_at", { ascending: false, nullsFirst: false })
+    .limit(cap);
+  if (error) throw toDbError("readMemoryRowsByBucketId failed", error);
+  return ensureArray(data);
+}
+
 function makeMemorySummary(memory = {}) {
   const title = memory.title ? `《${memory.title}》` : "未命名记忆";
   const layer = memory.layer || "unknown";
@@ -856,6 +870,163 @@ function calcHoldSimilarity(inputRow, candidate) {
   if (im && cm && im === cm) score += 0.02;
 
   return Math.round(Math.min(score, 1) * 10000) / 10000;
+}
+
+// ── Bucket clustering helpers ─────────────────────────────────────────────────
+
+const BUCKET_TAGS_MAX = 10;
+const BUCKET_DOMAIN_MAX = 5;
+const BUCKET_MATCH_THRESHOLD = 0.28;
+
+function normalizeBucketText(text) {
+  return String(text || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "_")
+    .replace(/[^\w一-鿿]/g, "");
+}
+
+function makeStableBucketId(seed) {
+  const hash = createHash("sha256").update(String(seed)).digest("hex").slice(0, 8);
+  return `bucket_${hash}`;
+}
+
+function inferBucketSeed(memory) {
+  const layer = String(memory.layer || "daily");
+  const subLayer = String(memory.sub_layer || "").trim();
+  const keywords = ensureArray(memory.keywords);
+  const title = String(memory.title || "").trim();
+  if (subLayer) {
+    const topKw = keywords[0] ? normalizeBucketText(keywords[0]) : "";
+    return `${layer}/${subLayer}/${topKw}`.replace(/\/+$/, "");
+  }
+  if (keywords.length > 0) {
+    const topKw = normalizeBucketText(keywords[0]);
+    if (topKw) return `${layer}/${topKw}`;
+  }
+  if (title) {
+    const titleKey = normalizeBucketText(title.slice(0, 20));
+    if (titleKey) return `${layer}/${titleKey}`;
+  }
+  return layer;
+}
+
+function scoreBucketMatch(memory, bucketCandidate) {
+  let score = 0;
+
+  const ml = String(memory.layer || "").toLowerCase();
+  const bl = String(bucketCandidate.layer || "").toLowerCase();
+  if (ml && bl && ml === bl) score += 0.20;
+
+  const ms = String(memory.sub_layer || "").toLowerCase().trim();
+  const bs = String(bucketCandidate.sub_layer || "").toLowerCase().trim();
+  if (ms && bs && ms === bs) score += 0.15;
+
+  const mKws = new Set(ensureArray(memory.keywords).map((k) => String(k).toLowerCase()));
+  const bKws = new Set(ensureArray(bucketCandidate.keywords).map((k) => String(k).toLowerCase()));
+  if (mKws.size > 0 && bKws.size > 0) {
+    const intersection = [...mKws].filter((k) => bKws.has(k)).length;
+    const union = new Set([...mKws, ...bKws]).size;
+    score += 0.40 * (intersection / union);
+  }
+
+  const mt = String(memory.title || "").toLowerCase().trim();
+  const bn = String(bucketCandidate.name || "").toLowerCase().trim();
+  if (mt && bn && mt.length > 1 && bn.length > 1) {
+    if (mt.includes(bn) || bn.includes(mt)) score += 0.10;
+  }
+
+  const mDomain = new Set(ensureArray(memory.domain).map((d) => String(d).toLowerCase()));
+  const mTags = new Set(ensureArray(memory.tags).map((t) => String(t).toLowerCase()));
+  const bDomain = ensureArray(bucketCandidate.domain).map((d) => String(d).toLowerCase());
+  const bTags = ensureArray(bucketCandidate.tags).map((t) => String(t).toLowerCase());
+  const domainHits = bDomain.filter((d) => mDomain.has(d)).length;
+  const tagHits = bTags.filter((t) => mTags.has(t)).length;
+  const dtDenom = Math.max(bDomain.length + bTags.length, 1);
+  score += 0.10 * ((domainHits + tagHits) / dtDenom);
+
+  const la = parseDateLike(bucketCandidate.last_active);
+  if (la) {
+    const days = Math.max(0, (Date.now() - la.getTime()) / 86400000);
+    if (days <= 1) score += 0.05;
+    else if (days <= 7) score += 0.03;
+    else if (days <= 30) score += 0.01;
+  }
+
+  return Math.round(Math.min(score, 1) * 10000) / 10000;
+}
+
+async function findBestBucketForMemory(memory) {
+  try {
+    const client = getSupabaseClient();
+    const { data, error } = await client
+      .from(MEMORY_TABLE)
+      .select("bucket_id, bucket_type, name, domain, tags, keywords, layer, sub_layer, last_active, raw")
+      .not("bucket_id", "is", null)
+      .neq("bucket_id", "")
+      .order("updated_at", { ascending: false, nullsFirst: false })
+      .limit(300);
+    if (error || !data) return null;
+
+    const bucketMap = new Map();
+    for (const row of data) {
+      const bid = String(row.bucket_id || "");
+      if (!bid || bucketMap.has(bid)) continue;
+      const raw = ensureObject(row.raw, {});
+      bucketMap.set(bid, {
+        bucket_id: bid,
+        bucket_type: row.bucket_type || raw.bucket_type || "topic",
+        name: row.name || raw.name || "",
+        domain: ensureArray(row.domain ?? raw.domain),
+        tags: ensureArray(row.tags ?? raw.tags),
+        keywords: ensureArray(row.keywords),
+        layer: row.layer || "",
+        sub_layer: row.sub_layer || "",
+        last_active: row.last_active || raw.last_active || "",
+      });
+    }
+
+    if (!bucketMap.size) return null;
+
+    let best = null;
+    let bestScore = BUCKET_MATCH_THRESHOLD;
+    for (const candidate of bucketMap.values()) {
+      const s = scoreBucketMatch(memory, candidate);
+      if (s > bestScore) { bestScore = s; best = candidate; }
+    }
+    return best;
+  } catch (_) {
+    return null;
+  }
+}
+
+function inferBucketType(layer) {
+  if (layer === "diary") return "diary";
+  if (layer === "core" || layer === "treasure") return "core";
+  return "topic";
+}
+
+function buildBucketForMemory(memory) {
+  const seed = inferBucketSeed(memory);
+  const bucket_id = makeStableBucketId(seed);
+  const bucket_type = inferBucketType(String(memory.layer || "daily"));
+  const keywords = ensureArray(memory.keywords);
+  const title = String(memory.title || "").trim();
+  const subLayer = String(memory.sub_layer || "").trim();
+  const name = safeString(title || (keywords[0] ? String(keywords[0]) : "") || subLayer || seed, 100);
+  const domain = ensureArray(memory.domain).slice(0, BUCKET_DOMAIN_MAX);
+  const tags = [...new Set([...keywords, ...ensureArray(memory.tags), ...ensureArray(memory.domain)])].slice(0, BUCKET_TAGS_MAX);
+  return { bucket_id, bucket_type, name, domain, tags };
+}
+
+function applyBucketFields(row, bucket) {
+  if (!bucket) return row;
+  if (bucket.bucket_id) row.bucket_id = bucket.bucket_id;
+  if (bucket.bucket_type) row.bucket_type = bucket.bucket_type;
+  if (bucket.name) row.name = bucket.name;
+  if (Array.isArray(bucket.domain)) row.domain = bucket.domain;
+  if (Array.isArray(bucket.tags)) row.tags = bucket.tags;
+  return row;
 }
 
 // ── vault_briefing helpers ────────────────────────────────────────────────────
@@ -1581,6 +1752,12 @@ function createServer() {
       else if (protectedFlag) { inputRow.raw.protected = true; }
 
       if (!merge) {
+        if (!inputRow.bucket_id) {
+          try {
+            const bucket = await findBestBucketForMemory(inputRow) || buildBucketForMemory(inputRow);
+            applyBucketFields(inputRow, bucket);
+          } catch (_) {}
+        }
         const saved = await insertMemoryRow(inputRow);
         const item = denormalizeMemoryRow(saved);
         if (item?.id && (pinned || protectedFlag)) {
@@ -1638,6 +1815,12 @@ function createServer() {
       const best = scored[0];
 
       if (!best || best.score < threshold) {
+        if (!inputRow.bucket_id) {
+          try {
+            const bucket = await findBestBucketForMemory(inputRow) || buildBucketForMemory(inputRow);
+            applyBucketFields(inputRow, bucket);
+          } catch (_) {}
+        }
         const saved = await insertMemoryRow(inputRow);
         const item = denormalizeMemoryRow(saved);
         if (item?.id && (pinned || protectedFlag)) {
@@ -1718,6 +1901,20 @@ function createServer() {
       if (existingRaw.digested !== undefined) row.raw.digested = existingRaw.digested;
       row.raw.activation_count = newRaw.activation_count;
       row.raw.last_active = now;
+
+      // Bucket: prefer existing bucket; only auto-assign if existing has none
+      if (existing.bucket_id) {
+        row.bucket_id = existing.bucket_id;
+        row.bucket_type = existing.bucket_type || inferBucketType(existing.layer || "daily");
+        row.name = existing.name || "";
+        row.domain = ensureArray(existing.domain);
+        row.tags = [...new Set([...ensureArray(existing.tags), ...ensureArray(inputRow.tags)])].slice(0, BUCKET_TAGS_MAX);
+      } else {
+        try {
+          const bucket = await findBestBucketForMemory(row) || buildBucketForMemory(row);
+          applyBucketFields(row, bucket);
+        } catch (_) {}
+      }
 
       const saved = await updateMemoryRowById(existing.id, row);
       const item =
@@ -2198,6 +2395,28 @@ function createServer() {
       condensedRow.raw.digested_from_count = sources.length;
       condensedRow.raw.digest_generated_at = now;
 
+      // Inherit bucket from sources — pick the most-frequent bucket_id
+      const sourceBucketIds = [...new Set(sources.map((m) => m.bucket_id).filter(Boolean))];
+      condensedRow.raw.source_bucket_ids = sourceBucketIds;
+      if (sourceBucketIds.length > 0) {
+        const bucketFreq = {};
+        for (const m of sources) { if (m.bucket_id) bucketFreq[m.bucket_id] = (bucketFreq[m.bucket_id] || 0) + 1; }
+        const dominantBid = Object.entries(bucketFreq).sort((a, b) => b[1] - a[1])[0][0];
+        const rep = sources.find((m) => m.bucket_id === dominantBid);
+        if (rep) {
+          condensedRow.bucket_id = dominantBid;
+          condensedRow.bucket_type = rep.bucket_type || "topic";
+          condensedRow.name = rep.name || "";
+          condensedRow.domain = ensureArray(rep.domain).slice(0, BUCKET_DOMAIN_MAX);
+          condensedRow.tags = [...new Set(sources.flatMap((m) => ensureArray(m.tags)))].slice(0, BUCKET_TAGS_MAX);
+        }
+      } else {
+        try {
+          const bucket = await findBestBucketForMemory(condensedRow) || buildBucketForMemory(condensedRow);
+          applyBucketFields(condensedRow, bucket);
+        } catch (_) {}
+      }
+
       const savedCondensed = await insertMemoryRow(condensedRow);
       const item = denormalizeMemoryRow(savedCondensed);
 
@@ -2342,6 +2561,287 @@ function createServer() {
       ];
 
       return makeResult({ found: true, item, debug }, lines.join("\n"));
+    }
+  );
+
+  server.registerTool(
+    "memory_bucket_surface",
+    {
+      title: "Memory Bucket Surface",
+      description:
+        "Read-only. Aggregate memories by bucket and return cluster statistics " +
+        "(memory_count, open_count, resolved_count, pinned_count, protected_count, " +
+        "max_importance, last_active, score, sample_ids, sample_titles). " +
+        "Useful for discovering active topic clusters without reading every memory.",
+      inputSchema: z.object({
+        q: z.string().optional(),
+        profile: z.enum(["shared", "rowan", "arion", "all"]).optional().default("shared"),
+        include_resolved: z.boolean().optional().default(false),
+        include_archived: z.boolean().optional().default(false),
+        limit: z.number().int().min(1).max(50).optional().default(10),
+      }),
+      outputSchema: z.object({
+        buckets: z.array(z.object({
+          bucket_id: z.string(),
+          bucket_type: z.string(),
+          name: z.string(),
+          domain: z.array(z.string()),
+          tags: z.array(z.string()),
+          memory_count: z.number(),
+          open_count: z.number(),
+          resolved_count: z.number(),
+          pinned_count: z.number(),
+          protected_count: z.number(),
+          max_importance: z.number(),
+          last_active: z.string(),
+          score: z.number(),
+          sample_ids: z.array(z.string()),
+          sample_titles: z.array(z.string()),
+        })),
+        returned_count: z.number(),
+        generated_at: z.string(),
+      }),
+    },
+    async ({ q, profile = "shared", include_resolved = false, include_archived = false, limit = 10 }) => {
+      const client = getSupabaseClient();
+      const { data: rows, error } = await client
+        .from(MEMORY_TABLE)
+        .select("id, title, layer, sub_layer, bucket_id, bucket_type, name, domain, tags, importance, profiles, resolved, digested, pinned, protected, _archived, last_active, updated_at, raw")
+        .not("bucket_id", "is", null)
+        .neq("bucket_id", "")
+        .order("updated_at", { ascending: false, nullsFirst: false })
+        .limit(2000);
+      if (error) throw toDbError("memory_bucket_surface fetch failed", error);
+
+      let memories = ensureArray(rows).map(denormalizeMemoryRow).filter(Boolean);
+      if (!include_archived) memories = memories.filter((m) => !m._archived);
+      if (!include_resolved) memories = memories.filter((m) => !m.resolved);
+      memories = memories.filter((m) => matchesProfileFilter(m, profile));
+      if (q && String(q).trim()) memories = memories.filter((m) => memoryTextMatch(m, q));
+
+      // Group by bucket_id
+      const bucketMap = new Map();
+      for (const m of memories) {
+        const bid = m.bucket_id;
+        if (!bid) continue;
+        if (!bucketMap.has(bid)) {
+          bucketMap.set(bid, {
+            bucket_id: bid,
+            bucket_type: m.bucket_type || "topic",
+            name: m.name || "",
+            domain: ensureArray(m.domain),
+            tags: ensureArray(m.tags),
+            all: [],
+          });
+        }
+        bucketMap.get(bid).all.push(m);
+      }
+
+      const results = [];
+      for (const info of bucketMap.values()) {
+        const all = info.all;
+        const open = all.filter((m) => !m.resolved && !m._archived);
+        const resolvedArr = all.filter((m) => m.resolved);
+        const pinnedArr = all.filter((m) => m.pinned);
+        const protectedArr = all.filter((m) => m.protected);
+        const maxImportance = Math.max(...all.map((m) => Number(m.importance) || 0), 0);
+        const lastActive = all.reduce((best, m) => {
+          const d = parseDateLike(m.last_active || m.updated_at);
+          if (!d) return best;
+          return (!best || d > best) ? d : best;
+        }, null);
+        const openScores = open.map((m) => calcDecayScore(m)).sort((a, b) => b - a);
+        const bucketScore = openScores.slice(0, 3).reduce((s, v) => s + v, 0);
+        const sortedSamples = [...open]
+          .sort((a, b) => (Number(b.importance) || 0) - (Number(a.importance) || 0))
+          .slice(0, 3);
+        results.push({
+          bucket_id: info.bucket_id,
+          bucket_type: info.bucket_type,
+          name: info.name,
+          domain: info.domain,
+          tags: info.tags,
+          memory_count: all.length,
+          open_count: open.length,
+          resolved_count: resolvedArr.length,
+          pinned_count: pinnedArr.length,
+          protected_count: protectedArr.length,
+          max_importance: maxImportance,
+          last_active: lastActive ? lastActive.toISOString() : "",
+          score: Math.round(bucketScore * 10000) / 10000,
+          sample_ids: sortedSamples.map((m) => m.id),
+          sample_titles: sortedSamples.map((m) => m.title || ""),
+        });
+      }
+      results.sort((a, b) => b.score - a.score);
+      const cap = Math.max(1, Math.min(50, Number(limit) || 10));
+      const topResults = results.slice(0, cap);
+
+      log("info", "tool", {
+        tool: "memory_bucket_surface",
+        args: { q, profile, include_resolved, include_archived, limit },
+        result: { bucket_count: topResults.length },
+      });
+
+      const lines = topResults.map((b, i) =>
+        `【${i + 1}】${b.name || b.bucket_id} (${b.bucket_type}) · 记忆数=${b.memory_count} open=${b.open_count} score=${b.score} · tags=[${b.tags.slice(0, 4).join(",")}]`
+      );
+      return makeResult(
+        { buckets: topResults, returned_count: topResults.length, generated_at: new Date().toISOString() },
+        `共找到 ${topResults.length} 个 bucket：\n${lines.join("\n") || "（无）"}`
+      );
+    }
+  );
+
+  server.registerTool(
+    "memory_bucket_read",
+    {
+      title: "Memory Bucket Read",
+      description:
+        "Read-only. List memories belonging to a specific bucket_id, " +
+        "sorted by pinned > protected > importance > last_active. Does not touch/update records.",
+      inputSchema: z.object({
+        bucket_id: z.string().min(1),
+        include_resolved: z.boolean().optional().default(true),
+        include_archived: z.boolean().optional().default(false),
+        limit: z.number().int().min(1).max(100).optional().default(30),
+      }),
+      outputSchema: z.object({
+        bucket_id: z.string(),
+        items: z.array(memoryRecordSchema),
+        returned_count: z.number(),
+      }),
+    },
+    async ({ bucket_id, include_resolved = true, include_archived = false, limit = 30 }) => {
+      const rows = await readMemoryRowsByBucketId(bucket_id, { limit: 1000 });
+      let memories = rows.map(denormalizeMemoryRow).filter(Boolean);
+      if (!include_archived) memories = memories.filter((m) => !m._archived);
+      if (!include_resolved) memories = memories.filter((m) => !m.resolved);
+
+      memories.sort((a, b) => {
+        if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+        if (a.protected !== b.protected) return a.protected ? -1 : 1;
+        const ai = Number(a.importance) || 0;
+        const bi_ = Number(b.importance) || 0;
+        if (ai !== bi_) return bi_ - ai;
+        const ala = parseDateLike(a.last_active || a.updated_at) ?? new Date(0);
+        const bla = parseDateLike(b.last_active || b.updated_at) ?? new Date(0);
+        return bla.getTime() - ala.getTime();
+      });
+
+      const cap = Math.max(1, Math.min(100, Number(limit) || 30));
+      memories = memories.slice(0, cap);
+
+      log("info", "tool", {
+        tool: "memory_bucket_read",
+        args: { bucket_id, include_resolved, include_archived, limit },
+        result: { returned_count: memories.length },
+      });
+
+      const blocks = memories.length
+        ? memories.map((m, i) => `【${i + 1}/${memories.length}】\n${formatMemoryForModel(m, 800)}`).join("\n\n---\n\n")
+        : "（该 bucket 下无记忆）";
+      return makeResult(
+        { bucket_id, items: memories, returned_count: memories.length },
+        `bucket=${bucket_id}，共 ${memories.length} 条：\n\n${blocks}`
+      );
+    }
+  );
+
+  server.registerTool(
+    "memory_bucket_trace",
+    {
+      title: "Memory Bucket Trace",
+      description:
+        "Write tool for bucket management. " +
+        "rename: update the name field on all non-archived memories in the bucket. " +
+        "retag: merge new tags into all non-archived memories in the bucket. " +
+        "merge: reassign all non-archived memories from source bucket to target_bucket_id. " +
+        "Never deletes records or changes content/resolved/digested/_archived status.",
+      inputSchema: z.object({
+        bucket_id: z.string().min(1),
+        action: z.enum(["rename", "retag", "merge"]),
+        name: z.string().optional(),
+        tags: z.union([z.array(z.string()), z.string()]).optional(),
+        target_bucket_id: z.string().optional(),
+      }),
+      outputSchema: z.object({
+        action: z.string(),
+        bucket_id: z.string(),
+        updated_count: z.number(),
+        target_bucket_id: z.string().optional(),
+      }),
+    },
+    async ({ bucket_id, action, name, tags, target_bucket_id }) => {
+      const client = getSupabaseClient();
+      const now = new Date().toISOString();
+      const rows = await readMemoryRowsByBucketId(bucket_id, { limit: 2000 });
+      // Filter: not archived (check both top-level and raw)
+      const eligible = rows.filter((r) => {
+        const raw = ensureObject(r.raw, {});
+        return !(raw._archived || r._archived);
+      });
+
+      let updatedCount = 0;
+
+      if (action === "rename") {
+        if (!name || !String(name).trim()) throw new Error("name is required for rename");
+        const newName = safeString(String(name).trim(), STR_LIMITS.title);
+        await Promise.all(eligible.map(async (r) => {
+          try {
+            const raw = { ...ensureObject(r.raw, {}), name: newName };
+            await client.from(MEMORY_TABLE).update({ name: newName, raw, updated_at: now }).eq("id", r.id);
+            updatedCount++;
+          } catch (_) {}
+        }));
+
+      } else if (action === "retag") {
+        const newTags = splitKeywords(tags).slice(0, BUCKET_TAGS_MAX);
+        await Promise.all(eligible.map(async (r) => {
+          try {
+            const merged = [...new Set([...ensureArray(r.tags), ...newTags])].slice(0, BUCKET_TAGS_MAX);
+            const raw = { ...ensureObject(r.raw, {}), tags: merged };
+            await client.from(MEMORY_TABLE).update({ tags: merged, raw, updated_at: now }).eq("id", r.id);
+            updatedCount++;
+          } catch (_) {}
+        }));
+
+      } else if (action === "merge") {
+        if (!target_bucket_id || !String(target_bucket_id).trim()) throw new Error("target_bucket_id is required for merge");
+        // Fetch target bucket representative to inherit name/type
+        const { data: targetRows } = await client
+          .from(MEMORY_TABLE)
+          .select("bucket_type, name, domain, tags, raw")
+          .eq("bucket_id", target_bucket_id)
+          .limit(1);
+        const targetRow = targetRows?.[0];
+        const targetRaw = ensureObject(targetRow?.raw, {});
+        const targetBucketType = targetRow?.bucket_type || targetRaw.bucket_type || "topic";
+        const targetName = targetRow?.name || targetRaw.name || "";
+
+        await Promise.all(eligible.map(async (r) => {
+          try {
+            const raw = { ...ensureObject(r.raw, {}), bucket_id: target_bucket_id };
+            const payload = { bucket_id: target_bucket_id, bucket_type: targetBucketType, raw, updated_at: now };
+            if (targetName) payload.name = targetName;
+            await client.from(MEMORY_TABLE).update(payload).eq("id", r.id);
+            updatedCount++;
+          } catch (_) {}
+        }));
+      }
+
+      log("info", "tool", {
+        tool: "memory_bucket_trace",
+        args: { bucket_id, action, name, target_bucket_id },
+        result: { updated_count: updatedCount },
+      });
+
+      const result = { action, bucket_id, updated_count: updatedCount };
+      if (target_bucket_id) result.target_bucket_id = target_bucket_id;
+      return makeResult(
+        result,
+        `[bucket_trace] action=${action} bucket_id=${bucket_id} updated=${updatedCount}${target_bucket_id ? " → " + target_bucket_id : ""}`
+      );
     }
   );
 
