@@ -1545,6 +1545,17 @@ function createServer() {
       if (!merge) {
         const saved = await insertMemoryRow(inputRow);
         const item = denormalizeMemoryRow(saved);
+        if (item?.id && (pinned || protectedFlag)) {
+          try {
+            await getSupabaseClient()
+              .from(MEMORY_TABLE)
+              .update({
+                pinned: Boolean(inputRow.raw.pinned),
+                protected: Boolean(inputRow.raw.protected),
+              })
+              .eq("id", item.id);
+          } catch (_) {}
+        }
         log("info", "tool", {
           tool: "memory_hold",
           mode: "created",
@@ -1591,6 +1602,17 @@ function createServer() {
       if (!best || best.score < threshold) {
         const saved = await insertMemoryRow(inputRow);
         const item = denormalizeMemoryRow(saved);
+        if (item?.id && (pinned || protectedFlag)) {
+          try {
+            await getSupabaseClient()
+              .from(MEMORY_TABLE)
+              .update({
+                pinned: Boolean(inputRow.raw.pinned),
+                protected: Boolean(inputRow.raw.protected),
+              })
+              .eq("id", item.id);
+          } catch (_) {}
+        }
         log("info", "tool", {
           tool: "memory_hold",
           mode: "created",
@@ -1674,6 +1696,9 @@ function createServer() {
             updated_at: now,
             pinned: Boolean(newRaw.pinned),
             protected: Boolean(newRaw.protected),
+            resolved: Boolean(newRaw.resolved ?? existing.resolved),
+            digested: Boolean(newRaw.digested ?? existing.digested),
+            _archived: Boolean(newRaw._archived ?? existing._archived),
           })
           .eq("id", existing.id);
       } catch (_) {}
