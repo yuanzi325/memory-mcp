@@ -1302,13 +1302,15 @@ function createServer() {
 
       let rows;
       if (hasQuery) {
-        const [queryRows, recentRows] = await Promise.all([
-          queryMemoryRows({ q, layer, sub_layer, limit: Math.min(300, cap * 10) }),
-          readMemoryRows({ layer, sub_layer, limit: 300 }),
+        const batchLimit = Math.min(300, cap * 10);
+        const [textRows, kwRows, recentRows] = await Promise.all([
+          queryMemoryRows({ q, layer, sub_layer, limit: batchLimit }),
+          queryMemoryRows({ keywords: q, layer, sub_layer, limit: batchLimit }),
+          readMemoryRows({ layer, sub_layer, limit: 500 }),
         ]);
         const seen = new Set();
         rows = [];
-        for (const r of [...queryRows, ...recentRows]) {
+        for (const r of [...textRows, ...kwRows, ...recentRows]) {
           if (r?.id && !seen.has(r.id)) {
             seen.add(r.id);
             rows.push(r);
@@ -1326,9 +1328,21 @@ function createServer() {
         memories = memories.filter((m) => memoryTextMatch(m, q));
       }
 
-      const scored = memories.map((m) => ({ m, score: computeScore(m) }));
+      const scored = memories.map((m) => ({
+        m,
+        score: computeScore(m),
+        isHit: hasQuery ? memoryTextMatch(m, q) : true,
+      }));
       scored.sort((a, b) => b.score - a.score);
-      const top = scored.slice(0, cap);
+
+      let top;
+      if (hasQuery && !strict_q) {
+        const hits = scored.filter((s) => s.isHit);
+        const nonHits = scored.filter((s) => !s.isHit);
+        top = [...hits, ...nonHits].slice(0, cap);
+      } else {
+        top = scored.slice(0, cap);
+      }
 
       if (touch) {
         for (const { m } of top) {
