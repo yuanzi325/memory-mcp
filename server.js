@@ -2223,6 +2223,98 @@ function createServer() {
   );
 
   server.registerTool(
+    "memory_debug_read",
+    {
+      title: "Memory Debug Read",
+      description:
+        "Read-only diagnostic tool. Returns full state of one memory row including " +
+        "resolved/digested/pinned/protected/_archived flags and digest-related raw fields. " +
+        "Does not write, touch, or update activation_count.",
+      inputSchema: z.object({
+        id: z.string(),
+      }),
+      outputSchema: z.object({
+        found: z.boolean(),
+        item: memoryRecordSchema.nullable(),
+        debug: z.object({
+          id: z.string(),
+          legacy_id: z.string(),
+          title: z.string(),
+          layer: z.string(),
+          sub_layer: z.string(),
+          keywords: z.array(z.string()),
+          profiles: z.array(z.string()),
+          resolved: z.boolean(),
+          digested: z.boolean(),
+          pinned: z.boolean(),
+          protected: z.boolean(),
+          _archived: z.boolean(),
+          activation_count: z.number(),
+          last_active: z.string(),
+          updated_at: z.string(),
+          raw_source_ids: z.array(z.string()),
+          raw_digested_from_count: z.number().nullable(),
+          raw_digest_generated_at: z.string(),
+        }).nullable(),
+      }),
+    },
+    async ({ id }) => {
+      let row = isValidUuid(id) ? await readMemoryById(id) : null;
+      if (!row) row = await readMemoryByLegacyId(id);
+
+      if (!row) {
+        return makeResult(
+          { found: false, item: null, debug: null },
+          `[debug] 未找到 id=${id}`
+        );
+      }
+
+      const item = denormalizeMemoryRow(row);
+      const raw = ensureObject(row.raw, {});
+      const {
+        resolved: _r, pinned: _p, protected: protectedFlag,
+        digested: _d, _archived: _a,
+      } = item ?? {};
+
+      const debug = {
+        id: item?.id ?? "",
+        legacy_id: String(row.legacy_id ?? ""),
+        title: item?.title ?? "",
+        layer: item?.layer ?? "",
+        sub_layer: item?.sub_layer ?? "",
+        keywords: ensureArray(item?.keywords),
+        profiles: effectiveProfiles(item?.profiles),
+        resolved: Boolean(_r),
+        digested: Boolean(_d),
+        pinned: Boolean(_p),
+        protected: Boolean(protectedFlag),
+        _archived: Boolean(_a),
+        activation_count: Number(item?.activation_count ?? 0),
+        last_active: String(item?.last_active ?? ""),
+        updated_at: String(item?.updated_at ?? ""),
+        raw_source_ids: ensureArray(raw.source_ids).map(String),
+        raw_digested_from_count: raw.digested_from_count != null ? Number(raw.digested_from_count) : null,
+        raw_digest_generated_at: String(raw.digest_generated_at ?? ""),
+      };
+
+      const lines = [
+        `[debug] id=${debug.id}`,
+        `title=${debug.title || "(无)"}  layer=${debug.layer}${debug.sub_layer ? "/" + debug.sub_layer : ""}`,
+        `resolved=${debug.resolved}  digested=${debug.digested}  pinned=${debug.pinned}  protected=${debug.protected}  _archived=${debug._archived}`,
+        `activation_count=${debug.activation_count}  last_active=${debug.last_active}`,
+        `keywords=[${debug.keywords.join(", ")}]`,
+        `profiles=[${debug.profiles.join(", ")}]`,
+        `raw_source_ids=[${debug.raw_source_ids.join(", ") || "(无)"}]`,
+        `raw_digested_from_count=${debug.raw_digested_from_count ?? "(无)"}`,
+        `raw_digest_generated_at=${debug.raw_digest_generated_at || "(无)"}`,
+        `updated_at=${debug.updated_at}`,
+      ];
+
+      return makeResult({ found: true, item, debug }, lines.join("\n"));
+    }
+  );
+
+  server.registerTool(
     "vault_briefing",
     {
       title: "Vault Briefing",
