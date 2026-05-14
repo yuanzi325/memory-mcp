@@ -1966,6 +1966,202 @@ function createServer() {
   );
 
   server.registerTool(
+    "memory_digest",
+    {
+      title: "Memory Digest",
+      description:
+        "Consolidate a batch of fragmented memories into one long-term condensed memory, " +
+        "then mark sources as resolved+digested to keep the pool clean. " +
+        "Use dry_run=true (default) to preview candidates before committing.",
+      inputSchema: z.object({
+        source_ids: z.array(z.string()).optional(),
+        q: z.string().optional(),
+        layer: z.string().optional(),
+        sub_layer: z.string().optional(),
+        profile: z.enum(["shared", "rowan", "arion", "all"]).optional().default("shared"),
+        limit: z.number().int().min(1).max(30).optional().default(10),
+        title: z.string().optional(),
+        content: z.string().optional(),
+        keywords: z.union([z.array(z.string()), z.string()]).optional(),
+        profiles: z.union([z.array(z.string()), z.string()]).optional(),
+        importance: z.number().int().min(1).max(10).optional(),
+        dry_run: z.boolean().optional().default(true),
+        mark_sources: z.boolean().optional().default(true),
+      }),
+      outputSchema: z.object({
+        mode: z.enum(["preview", "digested"]),
+        item: memoryRecordSchema.nullable().optional(),
+        sources: z.array(memoryRecordSchema),
+        source_ids: z.array(z.string()),
+        digested_count: z.number(),
+        skipped_count: z.number(),
+        skipped_reasons: z.array(z.string()),
+      }),
+    },
+    async ({
+      source_ids,
+      q,
+      layer = "daily",
+      sub_layer,
+      profile = "shared",
+      limit = 10,
+      title,
+      content,
+      keywords,
+      profiles,
+      importance,
+      dry_run = true,
+      mark_sources = true,
+    }) => {
+      // 1. Gather candidates
+      let rawCandidates = [];
+
+      if (source_ids && source_ids.length > 0) {
+        const fetched = await Promise.all(
+          source_ids.map((id) => isValidUuid(id) ? readMemoryById(id) : Promise.resolve(null))
+        );
+        rawCandidates = fetched.filter(Boolean).map(denormalizeMemoryRow).filter(Boolean);
+      } else {
+        const [queryRows, recentRows] = await Promise.all([
+          q ? queryMemoryRows({ q, layer, sub_layer, limit: limit * 3 }) : Promise.resolve([]),
+          readMemoryRows({ layer, sub_layer, limit: limit * 3 }),
+        ]);
+        const seen = new Set();
+        const merged = [];
+        for (const r of [...queryRows, ...recentRows]) {
+          if (r?.id && !seen.has(r.id)) {
+            seen.add(r.id);
+            const den = denormalizeMemoryRow(r);
+            if (den) merged.push(den);
+          }
+        }
+        rawCandidates = merged.filter((m) => matchesProfileFilter(m, profile)).slice(0, limit * 2);
+      }
+
+      // 2. Filter: skip archived, resolved, pinned, protected
+      const eligible = [];
+      const skipped = [];
+      for (const m of rawCandidates) {
+        if (m._archived)  { skipped.push(`${m.id}: _archived=true`);  continue; }
+        if (m.resolved)   { skipped.push(`${m.id}: resolved=true`);   continue; }
+        if (m.pinned)     { skipped.push(`${m.id}: pinned=true`);     continue; }
+        if (m.protected)  { skipped.push(`${m.id}: protected=true`);  continue; }
+        eligible.push(m);
+      }
+      const sources = eligible.slice(0, limit);
+      const resultSourceIds = sources.map((m) => m.id);
+
+      if (dry_run) {
+        log("info", "tool", {
+          tool: "memory_digest",
+          mode: "preview",
+          args: { source_ids, q, layer, sub_layer, profile, limit, dry_run },
+          result: { eligible: sources.length, skipped: skipped.length },
+        });
+        return makeResult(
+          {
+            mode: "preview",
+            sources,
+            source_ids: resultSourceIds,
+            digested_count: 0,
+            skipped_count: skipped.length,
+            skipped_reasons: skipped,
+          },
+          `[preview] ${sources.length} 条来源候选，${skipped.length} 条跳过。dry_run=true，未写入。source_ids=${resultSourceIds.join(", ") || "(无)"}`
+        );
+      }
+
+      // 3. Build condensed memory
+      const mergedKeywords = [
+        ...new Set([
+          ...sources.flatMap((m) => ensureArray(m.keywords)),
+          ...ensureArray(keywords),
+        ]),
+      ];
+      const mergedProfiles = [
+        ...new Set([
+          ...sources.flatMap((m) => effectiveProfiles(m.profiles)),
+          ...effectiveProfiles(profiles),
+        ]),
+      ];
+      const sourceMaxImportance = sources.reduce(
+        (max, m) => Math.max(max, Number(m.importance) || 0),
+        0
+      );
+      const condensedImportance = importance ?? Math.max(sourceMaxImportance, 3);
+      const now = new Date().toISOString();
+
+      const condensedRow = buildMemoryRow({
+        title: title || `消化摘要 ${now.slice(0, 10)}`,
+        content: content ||
+          sources.map((m, i) =>
+            `${i + 1}. ${m.title || m.id}: ${String(m.content || "").slice(0, 200)}`
+          ).join("\n"),
+        layer: "memo",
+        sub_layer,
+        keywords: mergedKeywords,
+        profiles: mergedProfiles,
+        importance: condensedImportance,
+      });
+      condensedRow.raw.source_ids = resultSourceIds;
+      condensedRow.raw.digested_from_count = sources.length;
+      condensedRow.raw.digest_generated_at = now;
+
+      const savedCondensed = await insertMemoryRow(condensedRow);
+      const item = denormalizeMemoryRow(savedCondensed);
+
+      // 4. Mark sources resolved + digested
+      let markedCount = 0;
+      if (mark_sources && sources.length > 0) {
+        await Promise.all(
+          sources.map(async (src) => {
+            try {
+              const existingRaw = ensureObject(src.raw, {});
+              const newRaw = { ...existingRaw, resolved: true, digested: true };
+              const cleanInput = { ...src };
+              for (const field of RAW_COMPAT_FIELDS) delete cleanInput[field];
+              delete cleanInput.digested;
+              cleanInput.raw = newRaw;
+              cleanInput.id = src.id;
+              const row = buildMemoryRow(cleanInput);
+              row.raw.resolved = true;
+              row.raw.digested = true;
+              await updateMemoryRowById(src.id, row);
+              try {
+                await getSupabaseClient()
+                  .from(MEMORY_TABLE)
+                  .update({ resolved: true, digested: true })
+                  .eq("id", src.id);
+              } catch (_) {}
+              markedCount++;
+            } catch (_) {}
+          })
+        );
+      }
+
+      log("info", "tool", {
+        tool: "memory_digest",
+        mode: "digested",
+        args: { source_ids, q, layer, sub_layer, profile, limit, dry_run, mark_sources },
+        result: { condensed_id: item?.id, digested_count: markedCount, skipped: skipped.length },
+      });
+
+      return makeResult(
+        {
+          mode: "digested",
+          item,
+          sources,
+          source_ids: resultSourceIds,
+          digested_count: markedCount,
+          skipped_count: skipped.length,
+          skipped_reasons: skipped,
+        },
+        `[digested] condensed_id=${item?.id} | title=${item?.title || "(无)"} | sources=${sources.length} digested=${markedCount} skipped=${skipped.length}`
+      );
+    }
+  );
+
+  server.registerTool(
     "vault_briefing",
     {
       title: "Vault Briefing",
