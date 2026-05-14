@@ -753,13 +753,12 @@ function memoryTextMatch(memory, q) {
 function calcHoldSimilarity(inputRow, candidate) {
   let score = 0;
 
-  // Keywords overlap (Jaccard) — weight 0.40
+  // Keywords: input coverage rate — weight 0.40
   const inputKws = new Set(ensureArray(inputRow.keywords).map((k) => String(k).toLowerCase()));
   const candKws = new Set(ensureArray(candidate.keywords).map((k) => String(k).toLowerCase()));
-  const kwUnion = new Set([...inputKws, ...candKws]);
-  if (kwUnion.size > 0) {
+  if (inputKws.size > 0) {
     const intersection = [...inputKws].filter((k) => candKws.has(k)).length;
-    score += 0.40 * (intersection / kwUnion.size);
+    score += 0.40 * (intersection / inputKws.size);
   }
 
   // Layer match — weight 0.15
@@ -772,8 +771,6 @@ function calcHoldSimilarity(inputRow, candidate) {
   const csl = String(candidate.sub_layer || "").toLowerCase();
   if (isl && csl) {
     if (isl === csl) score += 0.10;
-  } else if (!isl && !csl) {
-    score += 0.04; // both absent = slight alignment
   }
 
   // Title similarity — weight up to 0.20
@@ -1506,6 +1503,8 @@ function createServer() {
         mood: z.string().optional(),
         keywords: z.union([z.array(z.string()), z.string()]).optional(),
         profiles: z.union([z.array(z.string()), z.string()]).optional(),
+        pinned: z.boolean().optional(),
+        protected: z.boolean().optional(),
         importance: z.number().int().min(1).max(10).optional().default(2),
         date: z.string().optional(),
         merge: z.boolean().optional().default(true),
@@ -1529,6 +1528,8 @@ function createServer() {
       mood,
       keywords,
       profiles,
+      pinned,
+      protected: protectedFlag,
       importance = 2,
       date,
       merge = true,
@@ -1536,6 +1537,10 @@ function createServer() {
       limit = 20,
     }) => {
       const inputRow = buildMemoryRow({ content, title, layer, sub_layer, author, mood, keywords, profiles, importance, date });
+
+      // Apply pinned/protected to inputRow (only-raise; pinned forces protected)
+      if (pinned) { inputRow.raw.pinned = true; inputRow.raw.protected = true; }
+      else if (protectedFlag) { inputRow.raw.protected = true; }
 
       if (!merge) {
         const saved = await insertMemoryRow(inputRow);
@@ -1555,12 +1560,12 @@ function createServer() {
       // Build candidate pool
       const [kwRows, titleRows, recentRows] = await Promise.all([
         inputRow.keywords.length
-          ? queryMemoryRows({ keywords: inputRow.keywords, layer, sub_layer, limit: limit * 2 })
+          ? queryMemoryRows({ keywords: inputRow.keywords, layer, sub_layer, limit: limit * 5 })
           : Promise.resolve([]),
         title
-          ? queryMemoryRows({ q: title, layer, sub_layer, limit })
+          ? queryMemoryRows({ q: title, layer, sub_layer, limit: limit * 3 })
           : Promise.resolve([]),
-        readMemoryRows({ layer, sub_layer, limit }),
+        readMemoryRows({ layer, sub_layer, limit: limit * 3 }),
       ]);
 
       const seen = new Set();
@@ -1628,6 +1633,9 @@ function createServer() {
       // Preserve existing pinned/protected — never lower them on merge
       if (existing.pinned) newRaw.pinned = true;
       if (existing.protected) newRaw.protected = true;
+      // Apply incoming pinned/protected — only raise, never lower
+      if (pinned) { newRaw.pinned = true; newRaw.protected = true; }
+      else if (protectedFlag) { newRaw.protected = true; }
 
       const mergeInput = { ...existing };
       // Strip top-level compat fields before buildMemoryRow to prevent override
@@ -1645,8 +1653,8 @@ function createServer() {
 
       const row = buildMemoryRow(mergeInput);
       // Force-preserve values that buildMemoryRow might not carry
-      if (existing.pinned) row.raw.pinned = true;
-      if (existing.protected) row.raw.protected = true;
+      if (newRaw.pinned) row.raw.pinned = true;
+      if (newRaw.protected) row.raw.protected = true;
       if (existingRaw.digested !== undefined) row.raw.digested = existingRaw.digested;
       row.raw.activation_count = newRaw.activation_count;
       row.raw.last_active = now;
@@ -1660,7 +1668,13 @@ function createServer() {
       try {
         await getSupabaseClient()
           .from(MEMORY_TABLE)
-          .update({ activation_count: newRaw.activation_count, last_active: now, updated_at: now })
+          .update({
+            activation_count: newRaw.activation_count,
+            last_active: now,
+            updated_at: now,
+            pinned: Boolean(newRaw.pinned),
+            protected: Boolean(newRaw.protected),
+          })
           .eq("id", existing.id);
       } catch (_) {}
 
