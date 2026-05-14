@@ -750,6 +750,79 @@ function memoryTextMatch(memory, q) {
   );
 }
 
+function calcHoldSimilarity(inputRow, candidate) {
+  let score = 0;
+
+  // Keywords overlap (Jaccard) — weight 0.40
+  const inputKws = new Set(ensureArray(inputRow.keywords).map((k) => String(k).toLowerCase()));
+  const candKws = new Set(ensureArray(candidate.keywords).map((k) => String(k).toLowerCase()));
+  const kwUnion = new Set([...inputKws, ...candKws]);
+  if (kwUnion.size > 0) {
+    const intersection = [...inputKws].filter((k) => candKws.has(k)).length;
+    score += 0.40 * (intersection / kwUnion.size);
+  }
+
+  // Layer match — weight 0.15
+  const il = String(inputRow.layer || "").toLowerCase();
+  const cl = String(candidate.layer || "").toLowerCase();
+  if (il && cl && il === cl) score += 0.15;
+
+  // Sub_layer match — weight 0.10
+  const isl = String(inputRow.sub_layer || "").toLowerCase();
+  const csl = String(candidate.sub_layer || "").toLowerCase();
+  if (isl && csl) {
+    if (isl === csl) score += 0.10;
+  } else if (!isl && !csl) {
+    score += 0.04; // both absent = slight alignment
+  }
+
+  // Title similarity — weight up to 0.20
+  const it = String(inputRow.title || "").toLowerCase().trim();
+  const ct = String(candidate.title || "").toLowerCase().trim();
+  if (it && ct) {
+    if (it === ct) {
+      score += 0.20;
+    } else if (it.length > 3 && ct.includes(it)) {
+      score += 0.15;
+    } else if (ct.length > 3 && it.includes(ct)) {
+      score += 0.15;
+    } else {
+      // CJK-friendly character-level overlap
+      const itChars = new Set([...it].filter((c) => c.trim()));
+      const ctCharsArr = [...ct].filter((c) => c.trim());
+      const overlap = ctCharsArr.filter((c) => itChars.has(c)).length;
+      score += 0.08 * Math.min(overlap / Math.max(itChars.size, ctCharsArr.length, 1), 1);
+    }
+  }
+
+  // Content snippet match — weight up to 0.10
+  const ic = String(inputRow.content || "").toLowerCase();
+  const cc = String(candidate.content || "").toLowerCase();
+  if (ic.length >= 8 && cc.length >= 8) {
+    const snippet = ic.slice(0, 30);
+    if (cc.includes(snippet)) {
+      score += 0.10;
+    } else {
+      const icSample = new Set([...ic.slice(0, 120)].filter((c) => c.trim()));
+      const ccSample = [...cc.slice(0, 120)].filter((c) => c.trim());
+      const overlap = ccSample.filter((c) => icSample.has(c)).length;
+      score += 0.05 * Math.min(overlap / Math.max(icSample.size, ccSample.length, 1), 1);
+    }
+  }
+
+  // Author match — weight 0.03
+  const ia = String(inputRow.author || "").toLowerCase().trim();
+  const ca = String(candidate.author || "").toLowerCase().trim();
+  if (ia && ca && ia === ca) score += 0.03;
+
+  // Mood match — weight 0.02
+  const im = String(inputRow.mood || "").toLowerCase().trim();
+  const cm = String(candidate.mood || "").toLowerCase().trim();
+  if (im && cm && im === cm) score += 0.02;
+
+  return Math.round(Math.min(score, 1) * 10000) / 10000;
+}
+
 // ── vault_briefing helpers ────────────────────────────────────────────────────
 
 async function readVaultState() {
@@ -1411,6 +1484,207 @@ function createServer() {
       return makeResult(
         result,
         `记忆浮现完成（mode=${mode}），共返回 ${result.returned_count} 条（总数 ${result.total_memories}）：\n\n${blocks}`
+      );
+    }
+  );
+
+  server.registerTool(
+    "memory_hold",
+    {
+      title: "Memory Hold",
+      description:
+        "Write a new memory or merge into an existing similar one. " +
+        "Uses lightweight keyword/title/content similarity scoring (no embeddings). " +
+        "If the best candidate scores >= threshold the new content is appended to that memory; " +
+        "otherwise a new memory is created.",
+      inputSchema: z.object({
+        content: z.string().min(1),
+        title: z.string().optional(),
+        layer: z.string().optional(),
+        sub_layer: z.string().optional(),
+        author: z.string().optional(),
+        mood: z.string().optional(),
+        keywords: z.union([z.array(z.string()), z.string()]).optional(),
+        profiles: z.union([z.array(z.string()), z.string()]).optional(),
+        importance: z.number().int().min(1).max(10).optional().default(2),
+        date: z.string().optional(),
+        merge: z.boolean().optional().default(true),
+        threshold: z.number().min(0).max(1).optional().default(0.55),
+        limit: z.number().int().min(1).max(100).optional().default(20),
+      }),
+      outputSchema: z.object({
+        mode: z.enum(["created", "merged"]),
+        item: memoryRecordSchema,
+        matched_id: z.string().optional(),
+        similarity: z.number(),
+        considered_count: z.number(),
+      }),
+    },
+    async ({
+      content,
+      title,
+      layer = "daily",
+      sub_layer,
+      author,
+      mood,
+      keywords,
+      profiles,
+      importance = 2,
+      date,
+      merge = true,
+      threshold = 0.55,
+      limit = 20,
+    }) => {
+      const inputRow = buildMemoryRow({ content, title, layer, sub_layer, author, mood, keywords, profiles, importance, date });
+
+      if (!merge) {
+        const saved = await insertMemoryRow(inputRow);
+        const item = denormalizeMemoryRow(saved);
+        log("info", "tool", {
+          tool: "memory_hold",
+          mode: "created",
+          args: { layer, title, keyword_count: inputRow.keywords.length },
+          result: { item_id: item?.id },
+        });
+        return makeResult(
+          { mode: "created", item, similarity: 0, considered_count: 0 },
+          `已创建新记忆（merge=false）：${makeMemorySummary(item)}`
+        );
+      }
+
+      // Build candidate pool
+      const [kwRows, titleRows, recentRows] = await Promise.all([
+        inputRow.keywords.length
+          ? queryMemoryRows({ keywords: inputRow.keywords, layer, sub_layer, limit: limit * 2 })
+          : Promise.resolve([]),
+        title
+          ? queryMemoryRows({ q: title, layer, sub_layer, limit })
+          : Promise.resolve([]),
+        readMemoryRows({ layer, sub_layer, limit }),
+      ]);
+
+      const seen = new Set();
+      const candidates = [];
+      for (const r of [...kwRows, ...titleRows, ...recentRows]) {
+        if (r?.id && !seen.has(r.id)) {
+          seen.add(r.id);
+          const den = denormalizeMemoryRow(r);
+          if (den) candidates.push(den);
+        }
+      }
+
+      // Filter: no archived, no resolved
+      const eligible = candidates.filter((m) => !m._archived && !m.resolved);
+
+      // Score each candidate
+      const scored = eligible
+        .map((m) => ({ m, score: calcHoldSimilarity(inputRow, m) }))
+        .sort((a, b) => b.score - a.score);
+
+      const best = scored[0];
+
+      if (!best || best.score < threshold) {
+        const saved = await insertMemoryRow(inputRow);
+        const item = denormalizeMemoryRow(saved);
+        log("info", "tool", {
+          tool: "memory_hold",
+          mode: "created",
+          args: { layer, title, threshold },
+          result: { item_id: item?.id, best_score: best?.score ?? 0, considered_count: eligible.length },
+        });
+        return makeResult(
+          { mode: "created", item, similarity: best?.score ?? 0, considered_count: eligible.length },
+          `未找到足够相似的旧记忆（最高相似度 ${best?.score ?? 0}，阈值 ${threshold}），已创建新记忆：${makeMemorySummary(item)}`
+        );
+      }
+
+      // Merge into best match
+      const existing = best.m;
+      const existingRaw = ensureObject(existing.raw, {});
+
+      const appendDate = (date || new Date().toISOString()).slice(0, 10);
+      const mergedContent =
+        String(existing.content || "") +
+        `\n\n---\n补充于 ${appendDate}：\n${inputRow.content}`;
+
+      const mergedKeywords = [
+        ...new Set([...ensureArray(existing.keywords), ...inputRow.keywords]),
+      ];
+      const mergedProfiles = [
+        ...new Set([...effectiveProfiles(existing.profiles), ...inputRow.profiles]),
+      ];
+      const mergedImportance = Math.max(
+        Number(existing.importance) || 0,
+        inputRow.importance
+      );
+
+      const now = new Date().toISOString();
+      const newRaw = {
+        ...existingRaw,
+        activation_count:
+          (Number(existingRaw.activation_count ?? existing.activation_count) || 0) + 1,
+        last_active: now,
+      };
+      // Preserve existing pinned/protected — never lower them on merge
+      if (existing.pinned) newRaw.pinned = true;
+      if (existing.protected) newRaw.protected = true;
+
+      const mergeInput = { ...existing };
+      // Strip top-level compat fields before buildMemoryRow to prevent override
+      for (const field of RAW_COMPAT_FIELDS) delete mergeInput[field];
+      delete mergeInput.digested;
+
+      mergeInput.content = mergedContent;
+      mergeInput.keywords = mergedKeywords;
+      mergeInput.profiles = mergedProfiles;
+      mergeInput.importance = mergedImportance;
+      if (mood) mergeInput.mood = mood;
+      if (author) mergeInput.author = author;
+      mergeInput.raw = newRaw;
+      mergeInput.id = existing.id;
+
+      const row = buildMemoryRow(mergeInput);
+      // Force-preserve values that buildMemoryRow might not carry
+      if (existing.pinned) row.raw.pinned = true;
+      if (existing.protected) row.raw.protected = true;
+      if (existingRaw.digested !== undefined) row.raw.digested = existingRaw.digested;
+      row.raw.activation_count = newRaw.activation_count;
+      row.raw.last_active = now;
+
+      const saved = await updateMemoryRowById(existing.id, row);
+      const item =
+        denormalizeMemoryRow(saved) ??
+        denormalizeMemoryRow({ ...row, id: existing.id });
+
+      // Attempt top-level compat column sync
+      try {
+        await getSupabaseClient()
+          .from(MEMORY_TABLE)
+          .update({ activation_count: newRaw.activation_count, last_active: now, updated_at: now })
+          .eq("id", existing.id);
+      } catch (_) {}
+
+      log("info", "tool", {
+        tool: "memory_hold",
+        mode: "merged",
+        args: { layer, title, threshold },
+        result: {
+          matched_id: existing.id,
+          similarity: best.score,
+          considered_count: eligible.length,
+          appended_length: inputRow.content.length,
+        },
+      });
+
+      return makeResult(
+        {
+          mode: "merged",
+          item,
+          matched_id: existing.id,
+          similarity: best.score,
+          considered_count: eligible.length,
+        },
+        `已合并到旧记忆：${makeMemorySummary(item)}。相似度=${best.score}，阈值=${threshold}，追加 ${inputRow.content.length} 字，考虑了 ${eligible.length} 条候选。`
       );
     }
   );
