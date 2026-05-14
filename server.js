@@ -254,6 +254,11 @@ function ensureArray(value) {
   return Array.isArray(value) ? value : [];
 }
 
+function effectiveProfiles(value) {
+  const profiles = ensureArray(value).map((v) => String(v).trim()).filter(Boolean);
+  return profiles.length ? profiles : ["shared"];
+}
+
 function safeString(value, max) {
   const text = value == null ? "" : String(value);
   return text.length > max ? text.slice(0, max) : text;
@@ -390,7 +395,7 @@ function denormalizeMemoryRow(row) {
     author: row.author ?? "",
     mood: row.mood ?? "",
     keywords: ensureArray(row.keywords),
-    profiles: ensureArray(row.profiles),
+    profiles: effectiveProfiles(row.profiles),
     name: row.name ?? raw.name ?? "",
     domain: ensureArray(row.domain ?? raw.domain),
     tags: ensureArray(row.tags ?? raw.tags),
@@ -719,8 +724,7 @@ function calculateSurfaceScore(memory = {}) {
 }
 
 function matchesProfileFilter(memory, profileFilter) {
-  const profiles = ensureArray(memory.profiles);
-  const effective = profiles.length ? profiles : ["shared"];
+  const effective = effectiveProfiles(memory.profiles);
   if (profileFilter === "all") return true;
   if (profileFilter === "rowan") return effective.includes("shared") || effective.includes("rowan");
   if (profileFilter === "arion") return effective.includes("shared") || effective.includes("arion");
@@ -1323,7 +1327,7 @@ function createServer() {
         layer: m.layer ?? "",
         sub_layer: m.sub_layer ?? "",
         importance: typeof m.importance === "number" ? m.importance : 0,
-        profiles: ensureArray(m.profiles),
+        profiles: effectiveProfiles(m.profiles),
         keywords: ensureArray(m.keywords),
         name: m.name ?? "",
         domain: ensureArray(m.domain),
