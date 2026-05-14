@@ -578,6 +578,28 @@ async function countMemoryRows() {
   return typeof count === "number" ? count : 0;
 }
 
+async function touchMemoryRow(id) {
+  if (!isValidUuid(id)) return;
+  try {
+    const client = getSupabaseClient();
+    const { data: row, error } = await client
+      .from(MEMORY_TABLE)
+      .select("raw")
+      .eq("id", id)
+      .maybeSingle();
+    if (error || !row) return;
+    const raw = ensureObject(row.raw, {});
+    const currentCount = typeof raw.activation_count === "number" ? raw.activation_count : 0;
+    await client
+      .from(MEMORY_TABLE)
+      .update({
+        raw: { ...raw, activation_count: currentCount + 1, last_active: new Date().toISOString() },
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", id);
+  } catch (_) {}
+}
+
 function makeMemorySummary(memory = {}) {
   const title = memory.title ? `《${memory.title}》` : "未命名记忆";
   const layer = memory.layer || "unknown";
@@ -676,6 +698,16 @@ function calcDecayScore(memory = {}) {
   if (arousal > 0.7 && !memory.resolved) score *= 1.5;
 
   return Math.round(score * 10000) / 10000;
+}
+
+const calculateSurfaceScore = calcDecayScore;
+
+function matchesProfileFilter(memory, profileFilter) {
+  const profiles = ensureArray(memory.profiles);
+  if (profileFilter === "all") return true;
+  if (profileFilter === "rowan") return profiles.includes("shared") || profiles.includes("rowan");
+  if (profileFilter === "arion") return profiles.includes("shared") || profiles.includes("arion");
+  return profiles.includes("shared");
 }
 
 // ── vault_briefing helpers ────────────────────────────────────────────────────
@@ -1135,6 +1167,159 @@ function createServer() {
       return makeResult(
         result,
         `查询完成，共命中 ${result.returned_count} 条（总数 ${result.total_memories}）：\n\n${blocks}`
+      );
+    }
+  );
+
+  server.registerTool(
+    "memory_surface",
+    {
+      title: "Memory Surface",
+      description:
+        "Surface memories using an OB-style algorithm that scores by importance, recency, arousal, " +
+        "activation count, and pinned/protected status. Pinned memories appear first. Resolved memories " +
+        "are down-weighted. High-arousal unresolved memories are boosted. Optionally accepts a query to " +
+        "text-search first, then re-rank by weighted score.",
+      inputSchema: z.object({
+        q: z.string().optional().default(""),
+        profile: z.enum(["shared", "rowan", "arion", "all"]).optional().default("shared"),
+        layer: z.string().optional(),
+        sub_layer: z.string().optional(),
+        limit: z.number().int().min(1).max(30).optional().default(10),
+        include_resolved: z.boolean().optional().default(false),
+        include_archived: z.boolean().optional().default(false),
+        touch: z.boolean().optional().default(true),
+        snippet_length: z.number().int().min(0).optional().default(1200),
+      }),
+      outputSchema: z.object({
+        items: z.array(
+          z.object({
+            id: z.string(),
+            title: z.string(),
+            content: z.string(),
+            layer: z.string(),
+            sub_layer: z.string(),
+            importance: z.number(),
+            profiles: z.array(z.string()),
+            keywords: z.array(z.string()),
+            date: z.string(),
+            score: z.number(),
+            pinned: z.boolean(),
+            protected: z.boolean(),
+            resolved: z.boolean(),
+            activation_count: z.number(),
+            last_active: z.string(),
+          })
+        ),
+        returned_count: z.number(),
+        total_memories: z.number(),
+        touched: z.boolean(),
+        generated_at: z.string(),
+      }),
+    },
+    async ({
+      q = "",
+      profile = "shared",
+      layer,
+      sub_layer,
+      limit = 10,
+      include_resolved = false,
+      include_archived = false,
+      touch = true,
+      snippet_length = 1200,
+    }) => {
+      const cap = Math.max(1, Math.min(30, Number(limit) || 10));
+      const hasQuery = Boolean(q && String(q).trim());
+      const ql = hasQuery ? q.toLowerCase() : "";
+
+      function computeScore(m) {
+        let s = calculateSurfaceScore(m);
+        if (hasQuery) {
+          const title = String(m.title || "").toLowerCase();
+          const kws = ensureArray(m.keywords).map((k) => String(k).toLowerCase());
+          const content = String(m.content || "").toLowerCase();
+          if (title.includes(ql)) s *= 2.5;
+          else if (kws.some((k) => k.includes(ql))) s *= 1.8;
+          else if (content.includes(ql)) s *= 1.2;
+        }
+        return Math.round(s * 10000) / 10000;
+      }
+
+      let rows;
+      if (hasQuery) {
+        rows = await queryMemoryRows({ q, layer, sub_layer, limit: Math.min(300, cap * 10) });
+      } else {
+        rows = await readMemoryRows({ layer, sub_layer, limit: 300 });
+      }
+
+      let memories = rows.map(denormalizeMemoryRow).filter(Boolean);
+      if (!include_archived) memories = memories.filter((m) => !m._archived);
+      if (!include_resolved) memories = memories.filter((m) => !m.resolved);
+      memories = memories.filter((m) => matchesProfileFilter(m, profile));
+
+      const scored = memories.map((m) => ({ m, score: computeScore(m) }));
+      scored.sort((a, b) => b.score - a.score);
+      const top = scored.slice(0, cap);
+
+      if (touch) {
+        for (const { m } of top) {
+          touchMemoryRow(m.id).catch(() => {});
+        }
+      }
+
+      const total = await countMemoryRows();
+
+      function applySnippet(text) {
+        const s = String(text || "");
+        return snippet_length > 0 && s.length > snippet_length
+          ? s.slice(0, snippet_length) + `…（共 ${s.length} 字）`
+          : s;
+      }
+
+      const structuredItems = top.map(({ m, score }) => ({
+        id: m.id ?? "",
+        title: m.title ?? "",
+        content: applySnippet(m.content),
+        layer: m.layer ?? "",
+        sub_layer: m.sub_layer ?? "",
+        importance: typeof m.importance === "number" ? m.importance : 0,
+        profiles: ensureArray(m.profiles),
+        keywords: ensureArray(m.keywords),
+        date: m.date ?? "",
+        score,
+        pinned: Boolean(m.pinned),
+        protected: Boolean(m.protected),
+        resolved: Boolean(m.resolved),
+        activation_count: typeof m.activation_count === "number" ? m.activation_count : 0,
+        last_active: m.last_active ?? "",
+      }));
+
+      const result = {
+        items: structuredItems,
+        returned_count: structuredItems.length,
+        total_memories: total,
+        touched: touch && top.length > 0,
+        generated_at: new Date().toISOString(),
+      };
+
+      log("info", "tool", {
+        tool: "memory_surface",
+        args: { q, profile, layer, sub_layer, limit, include_resolved, include_archived, touch },
+        result: { returned_count: result.returned_count, total_memories: result.total_memories },
+      });
+
+      const blocks = top.length
+        ? top
+            .map(
+              ({ m, score }, i) =>
+                `【${i + 1}/${top.length}】score=${score}\n${formatMemoryForModel(m, snippet_length)}`
+            )
+            .join("\n\n---\n\n")
+        : "没有浮现任何记忆。";
+
+      return makeResult(
+        result,
+        `记忆浮现完成，共返回 ${result.returned_count} 条（总数 ${result.total_memories}）：\n\n${blocks}`
       );
     }
   );
