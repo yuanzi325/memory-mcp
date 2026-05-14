@@ -1416,6 +1416,137 @@ function createServer() {
   );
 
   server.registerTool(
+    "memory_trace",
+    {
+      title: "Memory Trace",
+      description:
+        "Update memory state after memory_surface surfacing. " +
+        "Supports marking resolved / digested / pinned, archiving / restoring, " +
+        "and patching importance, content, keywords, profiles, and title.",
+      inputSchema: z.object({
+        id: z.string(),
+        resolved: z.boolean().optional(),
+        pinned: z.boolean().optional(),
+        digested: z.boolean().optional(),
+        importance: z.number().int().min(1).max(10).optional(),
+        profiles: z.union([z.array(z.string()), z.string()]).optional(),
+        title: z.string().optional(),
+        content: z.string().optional(),
+        keywords: z.union([z.array(z.string()), z.string()]).optional(),
+        action: z.enum(["archive", "restore", "patch"]).optional().default("patch"),
+      }),
+      outputSchema: z.object({
+        item: memoryRecordSchema.nullable(),
+        updated_fields: z.array(z.string()),
+        updated_at: z.string(),
+      }),
+    },
+    async ({
+      id,
+      resolved,
+      pinned,
+      digested,
+      importance,
+      profiles,
+      title,
+      content,
+      keywords,
+      action = "patch",
+    }) => {
+      let existing = isValidUuid(id) ? await readMemoryById(id) : null;
+      if (!existing) existing = await readMemoryByLegacyId(id);
+      if (!existing) {
+        return makeResult(
+          { item: null, updated_fields: [], updated_at: "" },
+          `没有找到 id=${id} 的记忆。`
+        );
+      }
+
+      const existingRaw = ensureObject(existing.raw, {});
+      const newRaw = { ...existingRaw };
+      const updatedFields = [];
+
+      // action: archive / restore
+      if (action === "archive") {
+        newRaw._archived = true;
+        updatedFields.push("_archived");
+      } else if (action === "restore") {
+        newRaw._archived = false;
+        updatedFields.push("_archived");
+      }
+
+      // state flags → raw
+      if (resolved !== undefined) { newRaw.resolved = resolved; updatedFields.push("resolved"); }
+      if (pinned !== undefined) {
+        newRaw.pinned = pinned;
+        if (pinned) newRaw.protected = true;
+        updatedFields.push("pinned");
+        if (pinned) updatedFields.push("protected");
+      }
+      // digested is not in RAW_COMPAT_FIELDS — handle explicitly
+      if (digested !== undefined) { newRaw.digested = digested; updatedFields.push("digested"); }
+
+      // Build a clean input for buildMemoryRow: strip existing top-level compat fields
+      // so they don't override newRaw via buildMemoryRow's RAW_COMPAT_FIELDS loop.
+      const cleanInput = { ...existing };
+      for (const field of RAW_COMPAT_FIELDS) delete cleanInput[field];
+      delete cleanInput.digested;
+
+      // Apply non-compat patches
+      if (title !== undefined) { cleanInput.title = title; updatedFields.push("title"); }
+      if (content !== undefined) { cleanInput.content = content; updatedFields.push("content"); }
+      if (importance !== undefined) { cleanInput.importance = importance; updatedFields.push("importance"); }
+      if (keywords !== undefined) { cleanInput.keywords = keywords; updatedFields.push("keywords"); }
+      if (profiles !== undefined) { cleanInput.profiles = profiles; updatedFields.push("profiles"); }
+
+      cleanInput.raw = newRaw;
+      cleanInput.id = existing.id;
+
+      const row = buildMemoryRow(cleanInput);
+      // buildMemoryRow doesn't carry digested or action-based _archived via top-level (we deleted them);
+      // newRaw is used as the raw base, so they're preserved — but double-write to be safe.
+      if (digested !== undefined) row.raw.digested = digested;
+      if (action === "archive") row.raw._archived = true;
+      if (action === "restore") row.raw._archived = false;
+
+      const saved = await updateMemoryRowById(existing.id, row);
+      const item = denormalizeMemoryRow(saved) ?? denormalizeMemoryRow({ ...row, id: existing.id });
+
+      // Attempt to sync top-level compat columns; silently skip if columns don't exist
+      try {
+        const topLevel = {};
+        if (resolved !== undefined) topLevel.resolved = resolved;
+        if (pinned !== undefined) { topLevel.pinned = pinned; if (pinned) topLevel.protected = true; }
+        if (digested !== undefined) topLevel.digested = digested;
+        if (action === "archive") topLevel._archived = true;
+        if (action === "restore") topLevel._archived = false;
+        if (Object.keys(topLevel).length) {
+          await getSupabaseClient().from(MEMORY_TABLE).update(topLevel).eq("id", existing.id);
+        }
+      } catch (_) {}
+
+      log("info", "tool", {
+        tool: "memory_trace",
+        args: { id: existing.id, action, resolved, pinned, digested, importance, updated_fields: updatedFields },
+        result: { item_id: item?.id, updated_at: item?.updated_at },
+      });
+
+      const statusParts = [];
+      if (item?.pinned) statusParts.push("pinned");
+      if (item?.resolved) statusParts.push("resolved");
+      if (item?.digested) statusParts.push("digested");
+      if (item?._archived) statusParts.push("archived");
+      const statusStr = statusParts.length ? ` [${statusParts.join(", ")}]` : "";
+
+      return makeResult(
+        { item, updated_fields: updatedFields, updated_at: item?.updated_at || "" },
+        `已更新记忆${item?.title ? `《${item.title}》` : ""}${statusStr}，` +
+          `已修改字段：${updatedFields.join(", ") || "（无变化）"}。updated_at=${item?.updated_at || ""}`
+      );
+    }
+  );
+
+  server.registerTool(
     "memory_briefing",
     {
       title: "Memory Briefing",
