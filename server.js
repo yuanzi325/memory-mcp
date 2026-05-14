@@ -2270,6 +2270,7 @@ function createServer() {
       }
 
       const item = denormalizeMemoryRow(row);
+      if (item) delete item.raw;
       const raw = ensureObject(row.raw, {});
       const {
         resolved: _r, pinned: _p, protected: protectedFlag,
