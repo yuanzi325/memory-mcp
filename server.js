@@ -278,12 +278,20 @@ function clampNumber(value, min, max, fallback) {
   return Math.max(min, Math.min(max, number));
 }
 
+function flattenKeywordTokens(tokens) {
+  return [...new Set(
+    tokens
+      .slice(0, KEYWORDS_MAX)
+      .map((t) => safeString(String(t ?? "").trim(), STR_LIMITS.keyword).trim())
+      .filter(Boolean)
+  )];
+}
+
 function splitKeywords(value) {
   if (Array.isArray(value)) {
     const expanded = [];
     for (const item of value) {
       const s = String(item ?? "").trim();
-      // Detect element that is itself a JSON-stringified array
       if (s.startsWith("[")) {
         try {
           const parsed = JSON.parse(s);
@@ -298,20 +306,22 @@ function splitKeywords(value) {
       }
       if (s) expanded.push(s);
     }
-    return [...new Set(
-      expanded
-        .slice(0, KEYWORDS_MAX)
-        .map((item) => safeString(item, STR_LIMITS.keyword).trim())
-        .filter(Boolean)
-    )];
+    return flattenKeywordTokens(expanded);
   }
   if (typeof value === "string") {
-    return value
-      .split(/[，,、;；\n]/)
-      .slice(0, KEYWORDS_MAX)
-      .map((item) => item.trim())
-      .map((item) => safeString(item, STR_LIMITS.keyword))
-      .filter(Boolean);
+    const s = value.trim();
+    // Top-level JSON-stringified array: "[\"大同\",\"五一\"]"
+    if (s.startsWith("[")) {
+      try {
+        const parsed = JSON.parse(s);
+        if (Array.isArray(parsed)) {
+          return flattenKeywordTokens(parsed.map((v) => String(v ?? "").trim()));
+        }
+      } catch (_) {}
+    }
+    return flattenKeywordTokens(
+      s.split(/[，,、;；\n]/).map((t) => t.trim())
+    );
   }
   return [];
 }
