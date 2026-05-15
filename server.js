@@ -684,6 +684,13 @@ function formatMemoryForModel(memory = {}, snippetLength = 0) {
   lines.push(`标题: ${title}`);
   lines.push(`layer: ${memory.layer ?? ""}${memory.sub_layer ? " / " + memory.sub_layer : ""}`);
   lines.push(`importance: ${memory.importance ?? ""}`);
+  if (memory.bucket_id) {
+    const bucketParts = [`bucket_id: ${memory.bucket_id}`, `bucket_type: ${memory.bucket_type || "topic"}`];
+    if (memory.name) bucketParts.push(`name: ${memory.name}`);
+    if (memory.domain?.length) bucketParts.push(`domain: ${memory.domain.join(", ")}`);
+    if (memory.tags?.length) bucketParts.push(`tags: ${memory.tags.join(", ")}`);
+    lines.push(bucketParts.join(" | "));
+  }
   if (memory.date) lines.push(`date: ${memory.date}`);
   if (memory.author) lines.push(`author: ${memory.author}`);
   if (memory.mood) lines.push(`mood: ${memory.mood}`);
@@ -2509,6 +2516,9 @@ function createServer() {
           title: z.string(),
           layer: z.string(),
           sub_layer: z.string(),
+          bucket_id: z.string(),
+          bucket_type: z.string(),
+          name: z.string(),
           keywords: z.array(z.string()),
           profiles: z.array(z.string()),
           resolved: z.boolean(),
@@ -2550,6 +2560,9 @@ function createServer() {
         title: item?.title ?? "",
         layer: item?.layer ?? "",
         sub_layer: item?.sub_layer ?? "",
+        bucket_id: item?.bucket_id ?? "",
+        bucket_type: item?.bucket_type ?? "",
+        name: item?.name ?? "",
         keywords: ensureArray(item?.keywords),
         profiles: effectiveProfiles(item?.profiles),
         resolved: Boolean(_r),
@@ -2568,6 +2581,7 @@ function createServer() {
       const lines = [
         `[debug] id=${debug.id}`,
         `title=${debug.title || "(无)"}  layer=${debug.layer}${debug.sub_layer ? "/" + debug.sub_layer : ""}`,
+        `bucket_id=${debug.bucket_id || "(无)"}  bucket_type=${debug.bucket_type || "(无)"}  name=${debug.name || "(无)"}`,
         `resolved=${debug.resolved}  digested=${debug.digested}  pinned=${debug.pinned}  protected=${debug.protected}  _archived=${debug._archived}`,
         `activation_count=${debug.activation_count}  last_active=${debug.last_active}`,
         `keywords=[${debug.keywords.join(", ")}]`,
@@ -2624,7 +2638,7 @@ function createServer() {
       const client = getSupabaseClient();
       const { data: rows, error } = await client
         .from(MEMORY_TABLE)
-        .select("id, title, layer, sub_layer, bucket_id, bucket_type, name, domain, tags, importance, profiles, resolved, digested, pinned, protected, _archived, last_active, updated_at, raw")
+        .select("id, title, layer, sub_layer, bucket_id, bucket_type, name, domain, tags, importance, profiles, resolved, digested, pinned, protected, last_active, updated_at, raw")
         .not("bucket_id", "is", null)
         .neq("bucket_id", "")
         .order("updated_at", { ascending: false, nullsFirst: false })
