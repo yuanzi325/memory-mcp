@@ -3129,7 +3129,9 @@ function createServer() {
       const top = scored.slice(0, cap);
 
       // touch=true: deduplicate ids before touch to guard against duplicate rows in top
-      const touchIds = [...new Set(top.map(({ m }) => m.id).filter(isValidUuid))];
+      const touchIds = touch
+        ? [...new Set(top.map(({ m }) => m.id).filter(isValidUuid))]
+        : [];
       if (touch && touchIds.length) {
         log("info", "tool", {
           tool: "search_memories_surface_touch",
