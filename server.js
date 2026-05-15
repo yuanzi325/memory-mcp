@@ -793,19 +793,31 @@ function matchesProfileFilter(memory, profileFilter) {
 function memoryTextMatch(memory, q) {
   const ql = String(q || "").trim().toLowerCase();
   if (!ql) return true;
+  const raw = ensureObject(memory.raw, {});
   const title = String(memory.title || "").toLowerCase();
   const name = String(memory.name || "").toLowerCase();
+  const author = String(memory.author || "").toLowerCase();
+  const mood = String(memory.mood || "").toLowerCase();
   const keywords = ensureArray(memory.keywords).map((v) => String(v).toLowerCase());
   const tags = ensureArray(memory.tags).map((v) => String(v).toLowerCase());
   const domain = ensureArray(memory.domain).map((v) => String(v).toLowerCase());
   const content = String(memory.content || "").toLowerCase();
+  const whyPrecious = String(memory.why_precious || raw.why_precious || "").toLowerCase();
+  const todaySnapshot = String(memory.today_snapshot || raw.today_snapshot || "").toLowerCase();
+  const rawSummary = [raw.digest_text, raw.summary, raw.memo, raw.note]
+    .filter(Boolean).map((v) => String(v).toLowerCase()).join(" ");
   return (
     title.includes(ql) ||
     name.includes(ql) ||
+    author.includes(ql) ||
+    mood.includes(ql) ||
     keywords.some((v) => v.includes(ql)) ||
     tags.some((v) => v.includes(ql)) ||
     domain.some((v) => v.includes(ql)) ||
-    content.includes(ql)
+    content.includes(ql) ||
+    whyPrecious.includes(ql) ||
+    todaySnapshot.includes(ql) ||
+    Boolean(rawSummary && rawSummary.includes(ql))
   );
 }
 
@@ -3021,7 +3033,8 @@ function createServer() {
       const hasKw = kwList.length > 0;
       const hasSearch = hasQ || hasKw;
 
-      // Fetch: DB-side filtering for q/keywords, then JS-side scoring
+      // Fetch: DB-side pre-filter by search terms only; recent/surface rows are
+      // surface-mode only (q/keywords empty). Recency/importance only rank gated results.
       let rows;
       if (hasSearch) {
         const batchLimit = Math.min(600, cap * 15);
@@ -3033,9 +3046,6 @@ function createServer() {
         if (hasKw) {
           fetches.push(queryMemoryRows({ keywords, layer, sub_layer, limit: batchLimit }));
         }
-        // Pull recent rows too so high-importance nearby memories aren't missed
-        fetches.push(readMemoryRows({ layer, sub_layer, limit: 500 }));
-
         const batches = await Promise.all(fetches);
         const seen = new Set();
         rows = [];
@@ -3058,7 +3068,24 @@ function createServer() {
       if (!include_digested) memories = memories.filter((m) => !m.digested);
       memories = memories.filter((m) => matchesProfileFilter(m, profile));
 
-      // strict_q gate: no q hit → excluded entirely (no fall-through)
+      // Search gate: every result must have at least one hit when search terms are present.
+      // q and keywords are OR-combined. pinned/protected/importance only affect ranking
+      // of already-gated items — they cannot make a non-hit item enter the results.
+      if (hasSearch) {
+        memories = memories.filter((m) => {
+          const qHit = hasQ && memoryTextMatch(m, ql);
+          const kwHit = hasKw && (() => {
+            const memTerms = new Set([
+              ...ensureArray(m.keywords),
+              ...ensureArray(m.tags),
+              ...ensureArray(m.domain),
+            ].map((k) => String(k).toLowerCase()));
+            return kwList.some((kw) => memTerms.has(String(kw).toLowerCase()));
+          })();
+          return qHit || kwHit;
+        });
+      }
+      // strict_q: q must hit; kw-only hits do not satisfy this (returns 0 when q misses)
       if (hasQ && strict_q) {
         memories = memories.filter((m) => memoryTextMatch(m, ql));
       }
@@ -3095,10 +3122,8 @@ function createServer() {
       const top = scored.slice(0, cap);
 
       // touch=true: only touch the returned results, not the candidate pool
-      if (touch) {
-        for (const { m } of top) {
-          touchMemoryRow(m.id).catch(() => {});
-        }
+      if (touch && top.length) {
+        await Promise.allSettled(top.map(({ m }) => touchMemoryRow(m.id)));
       }
 
       const mode = hasQ && strict_q ? "strict" : hasSearch ? "search" : "surface";
