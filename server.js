@@ -3046,6 +3046,9 @@ function createServer() {
         if (hasKw) {
           fetches.push(queryMemoryRows({ keywords, layer, sub_layer, limit: batchLimit }));
         }
+        // Supplement with all rows so memoryTextMatch can catch name/tags/domain/raw fields
+        // that DB queries don't cover. Gate below ensures only hits enter results.
+        fetches.push(readMemoryRows({ layer, sub_layer, limit: 2000 }));
         const batches = await Promise.all(fetches);
         const seen = new Set();
         rows = [];
