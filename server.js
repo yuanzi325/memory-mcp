@@ -1286,6 +1286,7 @@ async function buildRecallContext({
   budget_chars = 4000,
   max_items = 20,
   include_resolved = false,
+  include_digested = false,
   include_archived = false,
   touch = false,
   include_buckets = true,
@@ -1296,7 +1297,19 @@ async function buildRecallContext({
   const BUCKET_SNIPPET_CAP = 200;
   const MAX_TIER3 = 3;
   const MAX_BUCKETS = 5;
-  const FRAME_OVERHEAD = 300;
+
+  function makeSnippet(m) {
+    const content = String(m.content || "");
+    return content.length > SNIPPET_CAP ? content.slice(0, SNIPPET_CAP) + "…" : content;
+  }
+
+  function filterClosed(arr) {
+    let out = arr;
+    if (!include_archived) out = out.filter((m) => !m._archived);
+    if (!include_resolved) out = out.filter((m) => !m.resolved);
+    if (!include_digested) out = out.filter((m) => !m.digested);
+    return out;
+  }
 
   // ─── Tier 1: Precise Search ─────────────────────────────────────────────
   let rows = [];
@@ -1320,9 +1333,7 @@ async function buildRecallContext({
     rows = await readMemoryRows({ layer, sub_layer, limit: 500 });
   }
 
-  let memories = rows.map(denormalizeMemoryRow).filter(Boolean);
-  if (!include_archived) memories = memories.filter((m) => !m._archived);
-  if (!include_resolved) memories = memories.filter((m) => !m.resolved);
+  let memories = filterClosed(rows.map(denormalizeMemoryRow).filter(Boolean));
   memories = memories.filter((m) => matchesProfileFilter(m, profile));
   if (hasQ) memories = memories.filter((m) => memoryTextMatch(m, ql));
 
@@ -1357,9 +1368,7 @@ async function buildRecallContext({
     readMemoryRows({ layer: "core", limit: 100 }),
     readMemoryRows({ layer: "treasure", limit: 100 }),
   ]);
-  let t3Mems = [...coreRows, ...treasureRows].map(denormalizeMemoryRow).filter(Boolean);
-  if (!include_archived) t3Mems = t3Mems.filter((m) => !m._archived);
-  if (!include_resolved) t3Mems = t3Mems.filter((m) => !m.resolved);
+  let t3Mems = filterClosed([...coreRows, ...treasureRows].map(denormalizeMemoryRow).filter(Boolean));
   t3Mems = t3Mems.filter((m) => matchesProfileFilter(m, profile));
   t3Mems = t3Mems.filter((m) => !t1Ids.has(m.id));
   t3Mems.sort((a, b) => {
@@ -1379,42 +1388,23 @@ async function buildRecallContext({
     tier: 3,
   }));
 
-  // ─── Merge + Budget Enforcement ──────────────────────────────────────────
+  // ─── Apply max_items cap ─────────────────────────────────────────────────
   const allCandidates = [...t1Candidates, ...t3Candidates];
-
-  function makeSnippet(m) {
-    const content = String(m.content || "");
-    return content.length > SNIPPET_CAP ? content.slice(0, SNIPPET_CAP) + "…" : content;
-  }
-
-  // Apply max_items cap first (lowest-priority items at end of array)
-  let selected = allCandidates.slice(0, max_items);
-  const omittedByMaxItems = allCandidates.length - selected.length;
-
-  // Drop whole items from end until total snippet chars fit budget
-  let omittedByBudget = 0;
-  let totalChars = selected.reduce((s, { m }) => s + makeSnippet(m).length, 0);
-  while (selected.length > 1 && totalChars + FRAME_OVERHEAD > budget_chars) {
-    const removed = selected.pop();
-    totalChars -= makeSnippet(removed.m).length;
-    omittedByBudget++;
-  }
-
-  const omittedCount = omittedByMaxItems + omittedByBudget;
-  const omittedReason = [];
-  if (omittedByMaxItems > 0) omittedReason.push("max_items");
-  if (omittedByBudget > 0) omittedReason.push("budget");
+  const omittedByMaxItems = Math.max(0, allCandidates.length - max_items);
+  // Working arrays — mutated during budget enforcement
+  let t1Items = t1Candidates.slice(0, max_items);
+  let t3Items = t3Candidates.slice(0, Math.max(0, max_items - t1Items.length));
 
   // ─── Tier 2: Bucket Context ──────────────────────────────────────────────
-  let selectedBuckets = [];
+  let buckets = [];
   if (include_buckets) {
-    const bucketIds = [...new Set(selected.map(({ m }) => m.bucket_id).filter(Boolean))].slice(0, MAX_BUCKETS);
+    const bucketIds = [
+      ...new Set([...t1Items, ...t3Items].map(({ m }) => m.bucket_id).filter(Boolean)),
+    ].slice(0, MAX_BUCKETS);
     const bucketResults = await Promise.all(
       bucketIds.map(async (bid) => {
         const bRows = await readMemoryRowsByBucketId(bid, { limit: 50 });
-        let bMems = bRows.map(denormalizeMemoryRow).filter(Boolean);
-        if (!include_archived) bMems = bMems.filter((m) => !m._archived);
-        if (!include_resolved) bMems = bMems.filter((m) => !m.resolved);
+        let bMems = filterClosed(bRows.map(denormalizeMemoryRow).filter(Boolean));
         bMems = bMems.filter((m) => matchesProfileFilter(m, profile));
         if (!bMems.length) return null;
         const topMem = [...bMems].sort((a, b) => (Number(b.importance) || 0) - (Number(a.importance) || 0))[0];
@@ -1428,11 +1418,74 @@ async function buildRecallContext({
         };
       })
     );
-    selectedBuckets = bucketResults.filter(Boolean);
+    buckets = bucketResults.filter(Boolean);
   }
 
-  // ─── Build selected_memories ─────────────────────────────────────────────
-  const selectedMemories = selected.map(({ m, score, reason, tier }) => ({
+  // ─── Build context_text (shared logic, called after each budget trim) ────
+  const generatedAt = new Date().toISOString();
+
+  function buildContextText(t1, t3, bkts, omittedMemories, omittedReasons) {
+    const ls = [`[RECALL — ${generatedAt}]`, `Query: ${ql || "(无)"}`];
+    if (t1.length) {
+      ls.push(`\n── 精确命中（${t1.length} 条）${"─".repeat(20)}`);
+      t1.forEach(({ m, score }, i) => {
+        ls.push(`${i + 1}. [${m.layer ?? ""}${m.sub_layer ? "/" + m.sub_layer : ""}] ${m.title || "未命名"}  score=${score}`);
+        ls.push(`   ${makeSnippet(m)}`);
+      });
+    }
+    if (bkts.length) {
+      ls.push(`\n── Bucket 上下文（${bkts.length} 个）${"─".repeat(16)}`);
+      for (const b of bkts) {
+        ls.push(`• ${b.name || b.bucket_id}（${b.bucket_type}，${b.memory_count} 条）: ${b.summary_snippet}`);
+      }
+    }
+    if (t3.length) {
+      ls.push(`\n── 常驻记忆（core/treasure，${t3.length} 条）${"─".repeat(10)}`);
+      t3.forEach(({ m }) => {
+        ls.push(`${m.title || "未命名"}: ${makeSnippet(m)}`);
+      });
+    }
+    if (omittedMemories > 0) {
+      ls.push(`\n── 已省略 ${omittedMemories} 条（${omittedReasons.join("、")}）${"─".repeat(12)}`);
+    }
+    return ls.join("\n");
+  }
+
+  // ─── Budget Enforcement (post-build, hard guarantee) ────────────────────
+  let omittedByBudget = 0;
+  let contextText = buildContextText(t1Items, t3Items, buckets, omittedByMaxItems, omittedByMaxItems > 0 ? ["max_items"] : []);
+
+  while (contextText.length > budget_chars) {
+    if (buckets.length > 0) {
+      // Priority 1: remove least-important bucket (last)
+      buckets.pop();
+    } else if (t3Items.length > 0) {
+      // Priority 2: remove last Tier 3 (already sorted lowest-priority last)
+      t3Items.pop();
+      omittedByBudget++;
+    } else if (t1Items.length > 1) {
+      // Priority 3: remove last Tier 1 (lowest score last)
+      t1Items.pop();
+      omittedByBudget++;
+    } else {
+      // Last resort: hard truncate the single remaining item's text
+      contextText = contextText.slice(0, budget_chars);
+      break;
+    }
+    const totalOmitted = omittedByMaxItems + omittedByBudget;
+    const reasons = [];
+    if (omittedByMaxItems > 0) reasons.push("max_items");
+    if (omittedByBudget > 0) reasons.push("budget");
+    contextText = buildContextText(t1Items, t3Items, buckets, totalOmitted, reasons);
+  }
+
+  const omittedCount = omittedByMaxItems + omittedByBudget;
+  const omittedReason = [];
+  if (omittedByMaxItems > 0) omittedReason.push("max_items");
+  if (omittedByBudget > 0) omittedReason.push("budget");
+
+  // ─── Build selected_memories from final t1Items + t3Items ────────────────
+  const selectedMemories = [...t1Items, ...t3Items].map(({ m, score, reason, tier }) => ({
     id: m.id ?? "",
     title: m.title ?? "",
     layer: m.layer ?? "",
@@ -1458,42 +1511,10 @@ async function buildRecallContext({
     await Promise.allSettled(touchIds.map((id) => touchMemoryRow(id)));
   }
 
-  // ─── context_text ─────────────────────────────────────────────────────────
-  const generatedAt = new Date().toISOString();
-  const t1Items = selected.filter(({ tier }) => tier === 1);
-  const t3Items = selected.filter(({ tier }) => tier === 3);
-  const lines = [`[RECALL — ${generatedAt}]`, `Query: ${ql || "(无)"}`];
-
-  if (t1Items.length) {
-    lines.push(`\n── 精确命中（${t1Items.length} 条）${"─".repeat(20)}`);
-    t1Items.forEach(({ m, score }, i) => {
-      lines.push(`${i + 1}. [${m.layer ?? ""}${m.sub_layer ? "/" + m.sub_layer : ""}] ${m.title || "未命名"}  score=${score}`);
-      lines.push(`   ${makeSnippet(m)}`);
-    });
-  }
-
-  if (selectedBuckets.length) {
-    lines.push(`\n── Bucket 上下文（${selectedBuckets.length} 个）${"─".repeat(16)}`);
-    for (const b of selectedBuckets) {
-      lines.push(`• ${b.name || b.bucket_id}（${b.bucket_type}，${b.memory_count} 条）: ${b.summary_snippet}`);
-    }
-  }
-
-  if (t3Items.length) {
-    lines.push(`\n── 常驻记忆（core/treasure，${t3Items.length} 条）${"─".repeat(10)}`);
-    t3Items.forEach(({ m }) => {
-      lines.push(`${m.title || "未命名"}: ${makeSnippet(m)}`);
-    });
-  }
-
-  if (omittedCount > 0) {
-    lines.push(`\n── 已省略 ${omittedCount} 条（${omittedReason.join("、")}）${"─".repeat(12)}`);
-  }
-
   return {
-    context_text: lines.join("\n"),
+    context_text: contextText,
     selected_memories: selectedMemories,
-    selected_buckets: selectedBuckets,
+    selected_buckets: buckets,
     omitted_count: omittedCount,
     omitted_reason: omittedReason,
     generated_at: generatedAt,
@@ -3512,6 +3533,7 @@ function createServer() {
         budget_chars: z.number().int().min(500).max(20000).optional().default(4000),
         max_items: z.number().int().min(1).max(50).optional().default(20),
         include_resolved: z.boolean().optional().default(false),
+        include_digested: z.boolean().optional().default(false),
         include_archived: z.boolean().optional().default(false),
         touch: z.boolean().optional().default(false),
         include_buckets: z.boolean().optional().default(true),
@@ -3561,6 +3583,7 @@ function createServer() {
       budget_chars = 4000,
       max_items = 20,
       include_resolved = false,
+      include_digested = false,
       include_archived = false,
       touch = false,
       include_buckets = true,
@@ -3573,6 +3596,7 @@ function createServer() {
         budget_chars,
         max_items,
         include_resolved,
+        include_digested,
         include_archived,
         touch,
         include_buckets,
@@ -3580,7 +3604,7 @@ function createServer() {
 
       log("info", "tool", {
         tool: "recall_context",
-        args: { q, profile, layer, sub_layer, budget_chars, max_items, include_resolved, include_archived, touch, include_buckets },
+        args: { q, profile, layer, sub_layer, budget_chars, max_items, include_resolved, include_digested, include_archived, touch, include_buckets },
         result: {
           selected_count: result.selected_memories.length,
           bucket_count: result.selected_buckets.length,
