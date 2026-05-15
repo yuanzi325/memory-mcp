@@ -809,6 +809,65 @@ function memoryTextMatch(memory, q) {
   );
 }
 
+// Returns { score, reason } for search_memories_surface.
+// Scoring is purely additive post-filter — pinned/protected never bypass q/kw gates.
+function scoreSearchResult(m, ql, kwList) {
+  const reasons = [];
+  const imp = Math.max(1, Math.min(10, Number(m.importance) || 5));
+  // Importance + capped decay as baseline (decay kept small so it doesn't bury keyword hits)
+  let score = imp * 0.5 + Math.min(calcDecayScore(m), 20) * 0.05;
+
+  if (ql) {
+    const q = ql.toLowerCase();
+    const title = String(m.title || "").toLowerCase();
+    const name = String(m.name || "").toLowerCase();
+    const kws = ensureArray(m.keywords).map((k) => String(k).toLowerCase());
+    const tags = ensureArray(m.tags).map((t) => String(t).toLowerCase());
+    const domain = ensureArray(m.domain).map((d) => String(d).toLowerCase());
+    const content = String(m.content || "").toLowerCase();
+    const whyPrecious = String(m.why_precious || "").toLowerCase();
+    const todaySnapshot = String(m.today_snapshot || "").toLowerCase();
+
+    if (title.includes(q) || name.includes(q)) {
+      score += imp * 3.0;
+      reasons.push("title/name");
+    } else if (
+      kws.some((k) => k.includes(q)) ||
+      tags.some((t) => t.includes(q)) ||
+      domain.some((d) => d.includes(q))
+    ) {
+      score += imp * 1.8;
+      reasons.push("kw/tag/domain");
+    } else if (content.includes(q) || whyPrecious.includes(q) || todaySnapshot.includes(q)) {
+      score += imp * 1.2;
+      reasons.push("content");
+    }
+  }
+
+  if (kwList.length) {
+    const memKws = new Set(ensureArray(m.keywords).map((k) => String(k).toLowerCase()));
+    const hits = kwList.filter((k) => memKws.has(String(k).toLowerCase()));
+    if (hits.length) {
+      const ratio = hits.length / kwList.length;
+      score += imp * ratio * 2.0;
+      reasons.push(`kw_overlap=${hits.length}/${kwList.length}`);
+    }
+  }
+
+  if (m.pinned) { score += 5; reasons.push("pinned"); }
+  else if (m.protected) { score += 2; reasons.push("protected"); }
+
+  // resolved/digested downweight (only reached when include_* flags are true)
+  if (m.resolved && m.digested) score *= 0.1;
+  else if (m.resolved) score *= 0.2;
+  else if (m.digested) score *= 0.3;
+
+  return {
+    score: Math.round(score * 10000) / 10000,
+    reason: reasons.join(", ") || "recency",
+  };
+}
+
 function calcHoldSimilarity(inputRow, candidate) {
   let score = 0;
 
@@ -2886,6 +2945,216 @@ function createServer() {
       return makeResult(
         result,
         `[bucket_trace] action=${action} bucket_id=${bucket_id} updated=${updatedCount}${target_bucket_id ? " → " + target_bucket_id : ""}`
+      );
+    }
+  );
+
+  server.registerTool(
+    "search_memories_surface",
+    {
+      title: "Search Memories Surface",
+      description:
+        "Read-only search tool. Score and rank memories by text match (q), keyword overlap, " +
+        "importance, and recency. Returns structured results with score/reason/content_snippet. " +
+        "Defaults: excludes archived/resolved/digested. strict_q=true returns empty when q has no hits. " +
+        "touch=false (default) — does NOT update activation_count or last_active.",
+      inputSchema: z.object({
+        q: z.string().optional(),
+        keywords: z.union([z.array(z.string()), z.string()]).optional(),
+        profile: z.enum(["shared", "rowan", "arion", "all"]).optional().default("shared"),
+        layer: z.string().optional(),
+        sub_layer: z.string().optional(),
+        limit: z.number().int().min(1).max(50).optional().default(10),
+        include_resolved: z.boolean().optional().default(false),
+        include_digested: z.boolean().optional().default(false),
+        include_archived: z.boolean().optional().default(false),
+        strict_q: z.boolean().optional().default(false),
+        touch: z.boolean().optional().default(false),
+      }),
+      outputSchema: z.object({
+        items: z.array(
+          z.object({
+            id: z.string(),
+            title: z.string(),
+            layer: z.string(),
+            sub_layer: z.string(),
+            content_snippet: z.string(),
+            keywords: z.array(z.string()),
+            profiles: z.array(z.string()),
+            bucket_id: z.string(),
+            bucket_type: z.string(),
+            name: z.string(),
+            importance: z.number(),
+            resolved: z.boolean(),
+            digested: z.boolean(),
+            pinned: z.boolean(),
+            protected: z.boolean(),
+            _archived: z.boolean(),
+            score: z.number(),
+            reason: z.string(),
+            updated_at: z.string(),
+            last_active: z.string(),
+          })
+        ),
+        returned_count: z.number(),
+        mode: z.string(),
+        generated_at: z.string(),
+      }),
+    },
+    async ({
+      q,
+      keywords,
+      profile = "shared",
+      layer,
+      sub_layer,
+      limit = 10,
+      include_resolved = false,
+      include_digested = false,
+      include_archived = false,
+      strict_q = false,
+      touch = false,
+    }) => {
+      const cap = Math.max(1, Math.min(50, Number(limit) || 10));
+      const ql = q ? String(q).trim() : "";
+      const hasQ = Boolean(ql);
+      const kwList = splitKeywords(keywords);
+      const hasKw = kwList.length > 0;
+      const hasSearch = hasQ || hasKw;
+
+      // Fetch: DB-side filtering for q/keywords, then JS-side scoring
+      let rows;
+      if (hasSearch) {
+        const batchLimit = Math.min(600, cap * 15);
+        const fetches = [];
+        if (hasQ) {
+          fetches.push(queryMemoryRows({ q: ql, layer, sub_layer, limit: batchLimit }));
+          fetches.push(queryMemoryRows({ keywords: ql, layer, sub_layer, limit: batchLimit }));
+        }
+        if (hasKw) {
+          fetches.push(queryMemoryRows({ keywords, layer, sub_layer, limit: batchLimit }));
+        }
+        // Pull recent rows too so high-importance nearby memories aren't missed
+        fetches.push(readMemoryRows({ layer, sub_layer, limit: 500 }));
+
+        const batches = await Promise.all(fetches);
+        const seen = new Set();
+        rows = [];
+        for (const batch of batches) {
+          for (const r of ensureArray(batch)) {
+            if (r?.id && !seen.has(r.id)) {
+              seen.add(r.id);
+              rows.push(r);
+            }
+          }
+        }
+      } else {
+        rows = await readMemoryRows({ layer, sub_layer, limit: 500 });
+      }
+
+      // Denormalize and filter
+      let memories = rows.map(denormalizeMemoryRow).filter(Boolean);
+      if (!include_archived) memories = memories.filter((m) => !m._archived);
+      if (!include_resolved) memories = memories.filter((m) => !m.resolved);
+      if (!include_digested) memories = memories.filter((m) => !m.digested);
+      memories = memories.filter((m) => matchesProfileFilter(m, profile));
+
+      // strict_q gate: no q hit → excluded entirely (no fall-through)
+      if (hasQ && strict_q) {
+        memories = memories.filter((m) => memoryTextMatch(m, ql));
+      }
+
+      // Score, build snippet, sort
+      const SNIPPET_LEN = 200;
+      const scored = memories.map((m) => {
+        const { score, reason } = scoreSearchResult(m, ql, kwList);
+
+        const content = String(m.content || "");
+        let snippet;
+        if (!content) {
+          snippet = "";
+        } else if (hasQ) {
+          const idx = content.toLowerCase().indexOf(ql.toLowerCase());
+          if (idx < 0) {
+            snippet = content.slice(0, SNIPPET_LEN) + (content.length > SNIPPET_LEN ? "…" : "");
+          } else {
+            const start = Math.max(0, idx - 40);
+            const end = Math.min(content.length, idx + SNIPPET_LEN);
+            snippet =
+              (start > 0 ? "…" : "") +
+              content.slice(start, end) +
+              (end < content.length ? "…" : "");
+          }
+        } else {
+          snippet = content.slice(0, SNIPPET_LEN) + (content.length > SNIPPET_LEN ? "…" : "");
+        }
+
+        return { m, score, reason, snippet };
+      });
+
+      scored.sort((a, b) => b.score - a.score);
+      const top = scored.slice(0, cap);
+
+      // touch=true: only touch the returned results, not the candidate pool
+      if (touch) {
+        for (const { m } of top) {
+          touchMemoryRow(m.id).catch(() => {});
+        }
+      }
+
+      const mode = hasQ && strict_q ? "strict" : hasSearch ? "search" : "surface";
+
+      const items = top.map(({ m, score, reason, snippet }) => ({
+        id: m.id ?? "",
+        title: m.title ?? "",
+        layer: m.layer ?? "",
+        sub_layer: m.sub_layer ?? "",
+        content_snippet: snippet,
+        keywords: ensureArray(m.keywords),
+        profiles: effectiveProfiles(m.profiles),
+        bucket_id: m.bucket_id ?? "",
+        bucket_type: m.bucket_type ?? "",
+        name: m.name ?? "",
+        importance: typeof m.importance === "number" ? m.importance : 0,
+        resolved: Boolean(m.resolved),
+        digested: Boolean(m.digested),
+        pinned: Boolean(m.pinned),
+        protected: Boolean(m.protected),
+        _archived: Boolean(m._archived),
+        score,
+        reason,
+        updated_at: m.updated_at ?? "",
+        last_active: m.last_active ?? "",
+      }));
+
+      log("info", "tool", {
+        tool: "search_memories_surface",
+        args: { q, keywords, profile, layer, sub_layer, limit, include_resolved, include_digested, include_archived, strict_q, touch },
+        result: { returned_count: items.length, mode },
+      });
+
+      const emptyMsg = hasQ && strict_q
+        ? `没有找到匹配 "${ql}" 的记忆。`
+        : "没有找到记忆。";
+
+      const blocks = top.length
+        ? top
+            .map(({ m, score, reason, snippet }, i) => {
+              const parts = [
+                `【${i + 1}/${top.length}】score=${score}  reason=${reason}`,
+                `标题: ${m.title || "未命名"}`,
+                `layer: ${m.layer ?? ""}${m.sub_layer ? "/" + m.sub_layer : ""}`,
+              ];
+              if (m.bucket_id) parts.push(`bucket: ${m.name || m.bucket_id} (${m.bucket_type || "topic"})`);
+              if (ensureArray(m.keywords).length) parts.push(`keywords: ${ensureArray(m.keywords).join(", ")}`);
+              if (snippet) parts.push(`snippet: ${snippet}`);
+              return parts.join("\n");
+            })
+            .join("\n\n---\n\n")
+        : emptyMsg;
+
+      return makeResult(
+        { items, returned_count: items.length, mode, generated_at: new Date().toISOString() },
+        `search_memories_surface（mode=${mode}），共返回 ${items.length} 条：\n\n${blocks}`
       );
     }
   );
