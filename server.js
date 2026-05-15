@@ -1278,6 +1278,231 @@ function buildVaultBriefing(stateJson, modules = [], limit = 3) {
   return { sections, counts, total_items };
 }
 
+async function buildRecallContext({
+  q,
+  profile = "shared",
+  layer,
+  sub_layer,
+  budget_chars = 4000,
+  max_items = 20,
+  include_resolved = false,
+  include_archived = false,
+  touch = false,
+  include_buckets = true,
+} = {}) {
+  const ql = q ? String(q).trim() : "";
+  const hasQ = Boolean(ql);
+  const SNIPPET_CAP = 600;
+  const BUCKET_SNIPPET_CAP = 200;
+  const MAX_TIER3 = 3;
+  const MAX_BUCKETS = 5;
+  const FRAME_OVERHEAD = 300;
+
+  // ─── Tier 1: Precise Search ─────────────────────────────────────────────
+  let rows = [];
+  if (hasQ) {
+    const batchLimit = Math.min(600, max_items * 15);
+    const batches = await Promise.all([
+      queryMemoryRows({ q: ql, layer, sub_layer, limit: batchLimit }),
+      queryMemoryRows({ keywords: ql, layer, sub_layer, limit: batchLimit }),
+      readMemoryRows({ layer, sub_layer, limit: 2000 }),
+    ]);
+    const seen = new Set();
+    for (const batch of batches) {
+      for (const r of ensureArray(batch)) {
+        if (r?.id && !seen.has(r.id)) {
+          seen.add(r.id);
+          rows.push(r);
+        }
+      }
+    }
+  } else {
+    rows = await readMemoryRows({ layer, sub_layer, limit: 500 });
+  }
+
+  let memories = rows.map(denormalizeMemoryRow).filter(Boolean);
+  if (!include_archived) memories = memories.filter((m) => !m._archived);
+  if (!include_resolved) memories = memories.filter((m) => !m.resolved);
+  memories = memories.filter((m) => matchesProfileFilter(m, profile));
+  if (hasQ) memories = memories.filter((m) => memoryTextMatch(m, ql));
+
+  const t1Scored = memories.map((m) => {
+    const { score, reason } = scoreSearchResult(m, ql, []);
+    return { m, score, reason, tier: 1 };
+  });
+  t1Scored.sort((a, b) => {
+    if (a.m.pinned !== b.m.pinned) return a.m.pinned ? -1 : 1;
+    return b.score - a.score;
+  });
+  const t1Candidates = t1Scored.slice(0, Math.min(max_items, 15));
+
+  // No Tier 1 hits → return empty; Tier 3 not supplemented
+  if (t1Candidates.length === 0) {
+    return {
+      context_text: "未找到相关记忆。",
+      selected_memories: [],
+      selected_buckets: [],
+      omitted_count: 0,
+      omitted_reason: [],
+      generated_at: new Date().toISOString(),
+      touch_applied: false,
+      touched_ids: [],
+      touched_count: 0,
+    };
+  }
+
+  // ─── Tier 3: Core/Treasure (only when Tier 1 has hits) ──────────────────
+  const t1Ids = new Set(t1Candidates.map(({ m }) => m.id));
+  const [coreRows, treasureRows] = await Promise.all([
+    readMemoryRows({ layer: "core", limit: 100 }),
+    readMemoryRows({ layer: "treasure", limit: 100 }),
+  ]);
+  let t3Mems = [...coreRows, ...treasureRows].map(denormalizeMemoryRow).filter(Boolean);
+  if (!include_archived) t3Mems = t3Mems.filter((m) => !m._archived);
+  if (!include_resolved) t3Mems = t3Mems.filter((m) => !m.resolved);
+  t3Mems = t3Mems.filter((m) => matchesProfileFilter(m, profile));
+  t3Mems = t3Mems.filter((m) => !t1Ids.has(m.id));
+  t3Mems.sort((a, b) => {
+    if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+    if (a.protected !== b.protected) return a.protected ? -1 : 1;
+    const ai = Number(a.importance) || 0;
+    const bi = Number(b.importance) || 0;
+    if (ai !== bi) return bi - ai;
+    const ada = parseDateLike(a.last_active || a.updated_at) ?? new Date(0);
+    const bda = parseDateLike(b.last_active || b.updated_at) ?? new Date(0);
+    return bda.getTime() - ada.getTime();
+  });
+  const t3Candidates = t3Mems.slice(0, MAX_TIER3).map((m) => ({
+    m,
+    score: Number(m.importance) || 0,
+    reason: `layer=${m.layer} importance=${m.importance}`,
+    tier: 3,
+  }));
+
+  // ─── Merge + Budget Enforcement ──────────────────────────────────────────
+  const allCandidates = [...t1Candidates, ...t3Candidates];
+
+  function makeSnippet(m) {
+    const content = String(m.content || "");
+    return content.length > SNIPPET_CAP ? content.slice(0, SNIPPET_CAP) + "…" : content;
+  }
+
+  // Apply max_items cap first (lowest-priority items at end of array)
+  let selected = allCandidates.slice(0, max_items);
+  const omittedByMaxItems = allCandidates.length - selected.length;
+
+  // Drop whole items from end until total snippet chars fit budget
+  let omittedByBudget = 0;
+  let totalChars = selected.reduce((s, { m }) => s + makeSnippet(m).length, 0);
+  while (selected.length > 1 && totalChars + FRAME_OVERHEAD > budget_chars) {
+    const removed = selected.pop();
+    totalChars -= makeSnippet(removed.m).length;
+    omittedByBudget++;
+  }
+
+  const omittedCount = omittedByMaxItems + omittedByBudget;
+  const omittedReason = [];
+  if (omittedByMaxItems > 0) omittedReason.push("max_items");
+  if (omittedByBudget > 0) omittedReason.push("budget");
+
+  // ─── Tier 2: Bucket Context ──────────────────────────────────────────────
+  let selectedBuckets = [];
+  if (include_buckets) {
+    const bucketIds = [...new Set(selected.map(({ m }) => m.bucket_id).filter(Boolean))].slice(0, MAX_BUCKETS);
+    const bucketResults = await Promise.all(
+      bucketIds.map(async (bid) => {
+        const bRows = await readMemoryRowsByBucketId(bid, { limit: 50 });
+        let bMems = bRows.map(denormalizeMemoryRow).filter(Boolean);
+        if (!include_archived) bMems = bMems.filter((m) => !m._archived);
+        if (!include_resolved) bMems = bMems.filter((m) => !m.resolved);
+        bMems = bMems.filter((m) => matchesProfileFilter(m, profile));
+        if (!bMems.length) return null;
+        const topMem = [...bMems].sort((a, b) => (Number(b.importance) || 0) - (Number(a.importance) || 0))[0];
+        const raw = String(topMem.content || topMem.title || "");
+        return {
+          bucket_id: bid,
+          name: topMem.name || "",
+          bucket_type: topMem.bucket_type || "topic",
+          memory_count: bMems.length,
+          summary_snippet: raw.slice(0, BUCKET_SNIPPET_CAP),
+        };
+      })
+    );
+    selectedBuckets = bucketResults.filter(Boolean);
+  }
+
+  // ─── Build selected_memories ─────────────────────────────────────────────
+  const selectedMemories = selected.map(({ m, score, reason, tier }) => ({
+    id: m.id ?? "",
+    title: m.title ?? "",
+    layer: m.layer ?? "",
+    sub_layer: m.sub_layer ?? "",
+    score,
+    reason,
+    content_snippet: makeSnippet(m),
+    bucket_id: m.bucket_id ?? "",
+    importance: typeof m.importance === "number" ? m.importance : 0,
+    tier,
+    pinned: Boolean(m.pinned),
+    protected: Boolean(m.protected),
+    resolved: Boolean(m.resolved),
+    digested: Boolean(m.digested),
+  }));
+
+  // ─── Touch ───────────────────────────────────────────────────────────────
+  const touchIds = touch
+    ? [...new Set(selectedMemories.map((item) => item.id).filter(isValidUuid))]
+    : [];
+  if (touch && touchIds.length) {
+    log("info", "tool", { tool: "recall_context_touch", touch_ids: touchIds, touch_count: touchIds.length });
+    await Promise.allSettled(touchIds.map((id) => touchMemoryRow(id)));
+  }
+
+  // ─── context_text ─────────────────────────────────────────────────────────
+  const generatedAt = new Date().toISOString();
+  const t1Items = selected.filter(({ tier }) => tier === 1);
+  const t3Items = selected.filter(({ tier }) => tier === 3);
+  const lines = [`[RECALL — ${generatedAt}]`, `Query: ${ql || "(无)"}`];
+
+  if (t1Items.length) {
+    lines.push(`\n── 精确命中（${t1Items.length} 条）${"─".repeat(20)}`);
+    t1Items.forEach(({ m, score }, i) => {
+      lines.push(`${i + 1}. [${m.layer ?? ""}${m.sub_layer ? "/" + m.sub_layer : ""}] ${m.title || "未命名"}  score=${score}`);
+      lines.push(`   ${makeSnippet(m)}`);
+    });
+  }
+
+  if (selectedBuckets.length) {
+    lines.push(`\n── Bucket 上下文（${selectedBuckets.length} 个）${"─".repeat(16)}`);
+    for (const b of selectedBuckets) {
+      lines.push(`• ${b.name || b.bucket_id}（${b.bucket_type}，${b.memory_count} 条）: ${b.summary_snippet}`);
+    }
+  }
+
+  if (t3Items.length) {
+    lines.push(`\n── 常驻记忆（core/treasure，${t3Items.length} 条）${"─".repeat(10)}`);
+    t3Items.forEach(({ m }) => {
+      lines.push(`${m.title || "未命名"}: ${makeSnippet(m)}`);
+    });
+  }
+
+  if (omittedCount > 0) {
+    lines.push(`\n── 已省略 ${omittedCount} 条（${omittedReason.join("、")}）${"─".repeat(12)}`);
+  }
+
+  return {
+    context_text: lines.join("\n"),
+    selected_memories: selectedMemories,
+    selected_buckets: selectedBuckets,
+    omitted_count: omittedCount,
+    omitted_reason: omittedReason,
+    generated_at: generatedAt,
+    touch_applied: touch && touchIds.length > 0,
+    touched_ids: touchIds,
+    touched_count: touchIds.length,
+  };
+}
+
 function createServer() {
   const server = new McpServer({
     name: "memory-mcp",
@@ -3265,6 +3490,107 @@ function createServer() {
       });
 
       return makeResult(result, briefingText);
+    }
+  );
+
+  server.registerTool(
+    "recall_context",
+    {
+      title: "Recall Context",
+      description:
+        "Build a compact recall context for the model from memories. " +
+        "Tier 1: precise text search (q-gated). " +
+        "Tier 2: bucket summaries for matched memories (include_buckets=true). " +
+        "Tier 3: core/treasure permanent memories — only appended when Tier 1 has hits. " +
+        "Returns context_text (Chinese-framed, ready-to-use), selected_memories, selected_buckets. " +
+        "touch=false by default (read-only). touch=true writes activation_count for final selected ids only.",
+      inputSchema: z.object({
+        q: z.string().min(1),
+        profile: z.enum(["shared", "rowan", "arion", "all"]).optional().default("shared"),
+        layer: z.string().optional(),
+        sub_layer: z.string().optional(),
+        budget_chars: z.number().int().min(500).max(20000).optional().default(4000),
+        max_items: z.number().int().min(1).max(50).optional().default(20),
+        include_resolved: z.boolean().optional().default(false),
+        include_archived: z.boolean().optional().default(false),
+        touch: z.boolean().optional().default(false),
+        include_buckets: z.boolean().optional().default(true),
+      }),
+      outputSchema: z.object({
+        context_text: z.string(),
+        selected_memories: z.array(
+          z.object({
+            id: z.string(),
+            title: z.string(),
+            layer: z.string(),
+            sub_layer: z.string(),
+            score: z.number(),
+            reason: z.string(),
+            content_snippet: z.string(),
+            bucket_id: z.string(),
+            importance: z.number(),
+            tier: z.number(),
+            pinned: z.boolean(),
+            protected: z.boolean(),
+            resolved: z.boolean(),
+            digested: z.boolean(),
+          })
+        ),
+        selected_buckets: z.array(
+          z.object({
+            bucket_id: z.string(),
+            name: z.string(),
+            bucket_type: z.string(),
+            memory_count: z.number(),
+            summary_snippet: z.string(),
+          })
+        ),
+        omitted_count: z.number(),
+        omitted_reason: z.array(z.string()),
+        generated_at: z.string(),
+        touch_applied: z.boolean(),
+        touched_ids: z.array(z.string()),
+        touched_count: z.number(),
+      }),
+    },
+    async ({
+      q,
+      profile = "shared",
+      layer,
+      sub_layer,
+      budget_chars = 4000,
+      max_items = 20,
+      include_resolved = false,
+      include_archived = false,
+      touch = false,
+      include_buckets = true,
+    }) => {
+      const result = await buildRecallContext({
+        q,
+        profile,
+        layer,
+        sub_layer,
+        budget_chars,
+        max_items,
+        include_resolved,
+        include_archived,
+        touch,
+        include_buckets,
+      });
+
+      log("info", "tool", {
+        tool: "recall_context",
+        args: { q, profile, layer, sub_layer, budget_chars, max_items, include_resolved, include_archived, touch, include_buckets },
+        result: {
+          selected_count: result.selected_memories.length,
+          bucket_count: result.selected_buckets.length,
+          omitted_count: result.omitted_count,
+          touch_applied: result.touch_applied,
+          context_chars: result.context_text.length,
+        },
+      });
+
+      return makeResult(result, result.context_text);
     }
   );
 
