@@ -2093,7 +2093,8 @@ function createServer() {
       const saved = await updateMemoryRowById(existing.id, row);
       const item = denormalizeMemoryRow(saved) ?? denormalizeMemoryRow({ ...row, id: existing.id });
 
-      // Attempt to sync top-level compat columns; silently skip if columns don't exist
+      // Keep real top-level status columns in sync with raw for faster querying.
+      // _archived is intentionally raw-only because public.memories has no top-level _archived column.
       try {
         const topLevel = {};
         if (resolved !== undefined) topLevel.resolved = resolved;
