@@ -1961,13 +1961,6 @@ function createServer() {
           })
           .eq("id", existing.id);
       } catch (_) {}
-      // _archived synced separately — column may not exist on all deployments
-      try {
-        await getSupabaseClient()
-          .from(MEMORY_TABLE)
-          .update({ _archived: Boolean(newRaw._archived ?? existing._archived) })
-          .eq("id", existing.id);
-      } catch (_) {}
 
       log("info", "tool", {
         tool: "memory_hold",
@@ -2107,8 +2100,6 @@ function createServer() {
         if (protectedFlag !== undefined) topLevel.protected = protectedFlag;
         if (pinned !== undefined) { topLevel.pinned = pinned; if (pinned) topLevel.protected = true; }
         if (digested !== undefined) topLevel.digested = digested;
-        if (action === "archive") topLevel._archived = true;
-        if (action === "restore") topLevel._archived = false;
         if (Object.keys(topLevel).length) {
           await getSupabaseClient().from(MEMORY_TABLE).update(topLevel).eq("id", existing.id);
         }
