@@ -1453,11 +1453,13 @@ async function buildRecallContext({
 
   // ─── Budget Enforcement (post-build, hard guarantee) ────────────────────
   let omittedByBudget = 0;
+  let budgetConstrained = false;
   let contextText = buildContextText(t1Items, t3Items, buckets, omittedByMaxItems, omittedByMaxItems > 0 ? ["max_items"] : []);
 
   while (contextText.length > budget_chars) {
+    budgetConstrained = true;
     if (buckets.length > 0) {
-      // Priority 1: remove least-important bucket (last)
+      // Priority 1: remove least-important bucket (last); not a memory, not counted in omittedByBudget
       buckets.pop();
     } else if (t3Items.length > 0) {
       // Priority 2: remove last Tier 3 (already sorted lowest-priority last)
@@ -1468,21 +1470,21 @@ async function buildRecallContext({
       t1Items.pop();
       omittedByBudget++;
     } else {
-      // Last resort: hard truncate the single remaining item's text
+      // Last resort: hard truncate — no more items to drop
       contextText = contextText.slice(0, budget_chars);
       break;
     }
     const totalOmitted = omittedByMaxItems + omittedByBudget;
     const reasons = [];
     if (omittedByMaxItems > 0) reasons.push("max_items");
-    if (omittedByBudget > 0) reasons.push("budget");
+    if (budgetConstrained) reasons.push("budget");
     contextText = buildContextText(t1Items, t3Items, buckets, totalOmitted, reasons);
   }
 
   const omittedCount = omittedByMaxItems + omittedByBudget;
   const omittedReason = [];
   if (omittedByMaxItems > 0) omittedReason.push("max_items");
-  if (omittedByBudget > 0) omittedReason.push("budget");
+  if (budgetConstrained) omittedReason.push("budget");
 
   // ─── Build selected_memories from final t1Items + t3Items ────────────────
   const selectedMemories = [...t1Items, ...t3Items].map(({ m, score, reason, tier }) => ({
