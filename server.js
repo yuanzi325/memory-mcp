@@ -3033,7 +3033,8 @@ function createServer() {
       const hasKw = kwList.length > 0;
       const hasSearch = hasQ || hasKw;
 
-      // Fetch: DB-side filtering for q/keywords, then JS-side scoring
+      // Fetch: DB-side pre-filter by search terms only; recent/surface rows are
+      // surface-mode only (q/keywords empty). Recency/importance only rank gated results.
       let rows;
       if (hasSearch) {
         const batchLimit = Math.min(600, cap * 15);
@@ -3045,9 +3046,6 @@ function createServer() {
         if (hasKw) {
           fetches.push(queryMemoryRows({ keywords, layer, sub_layer, limit: batchLimit }));
         }
-        // Pull recent rows too so high-importance nearby memories aren't missed
-        fetches.push(readMemoryRows({ layer, sub_layer, limit: 500 }));
-
         const batches = await Promise.all(fetches);
         const seen = new Set();
         rows = [];
@@ -3076,9 +3074,14 @@ function createServer() {
       if (hasSearch) {
         memories = memories.filter((m) => {
           const qHit = hasQ && memoryTextMatch(m, ql);
-          const kwHit = hasKw && ensureArray(m.keywords).some(
-            (k) => kwList.some((kw) => String(k).toLowerCase() === String(kw).toLowerCase())
-          );
+          const kwHit = hasKw && (() => {
+            const memTerms = new Set([
+              ...ensureArray(m.keywords),
+              ...ensureArray(m.tags),
+              ...ensureArray(m.domain),
+            ].map((k) => String(k).toLowerCase()));
+            return kwList.some((kw) => memTerms.has(String(kw).toLowerCase()));
+          })();
           return qHit || kwHit;
         });
       }
