@@ -644,6 +644,7 @@ async function touchMemoryRow(id) {
     const numericCount = Number(currentCount);
     const nextCount = Number.isFinite(numericCount) ? numericCount + 1 : 1;
     const now = new Date().toISOString();
+    log("info", "memory", { event: "touch_memory_row", id, current_count: numericCount, next_count: nextCount });
     await client
       .from(MEMORY_TABLE)
       .update({
@@ -3011,6 +3012,9 @@ function createServer() {
         returned_count: z.number(),
         mode: z.string(),
         generated_at: z.string(),
+        touched: z.boolean(),
+        touched_ids: z.array(z.string()),
+        touched_count: z.number(),
       }),
     },
     async ({
@@ -3124,9 +3128,15 @@ function createServer() {
       scored.sort((a, b) => b.score - a.score);
       const top = scored.slice(0, cap);
 
-      // touch=true: only touch the returned results, not the candidate pool
-      if (touch && top.length) {
-        await Promise.allSettled(top.map(({ m }) => touchMemoryRow(m.id)));
+      // touch=true: deduplicate ids before touch to guard against duplicate rows in top
+      const touchIds = [...new Set(top.map(({ m }) => m.id).filter(isValidUuid))];
+      if (touch && touchIds.length) {
+        log("info", "tool", {
+          tool: "search_memories_surface_touch",
+          touch_ids: touchIds,
+          touch_count: touchIds.length,
+        });
+        await Promise.allSettled(touchIds.map((id) => touchMemoryRow(id)));
       }
 
       const mode = hasQ && strict_q ? "strict" : hasSearch ? "search" : "surface";
@@ -3181,7 +3191,15 @@ function createServer() {
         : emptyMsg;
 
       return makeResult(
-        { items, returned_count: items.length, mode, generated_at: new Date().toISOString() },
+        {
+          items,
+          returned_count: items.length,
+          mode,
+          generated_at: new Date().toISOString(),
+          touched: touch && touchIds.length > 0,
+          touched_ids: touchIds,
+          touched_count: touchIds.length,
+        },
         `search_memories_surface（mode=${mode}），共返回 ${items.length} 条：\n\n${blocks}`
       );
     }
