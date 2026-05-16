@@ -2452,8 +2452,10 @@ function createServer() {
     {
       title: "Memory Briefing",
       description:
-        "Return a compact briefing (3–7 items) assembled from high-priority memo and daily memories, " +
-        "sorted by decay score. Intended to be injected once per session at the start of a conversation " +
+        "Return a compact briefing assembled from memo, diary, and daily memories. " +
+        "diary = 每日主记录（叙事/情绪/生活片段），briefing 优先显示其 today_snapshot；" +
+        "daily = 短期事项/临时上下文/提醒，不再作为每日自动记录与 diary 重复。" +
+        "Intended to be injected once per session at the start of a conversation " +
         "so the model is aware of recent context without manual querying.",
       inputSchema: z.object({}),
       outputSchema: z.object({
@@ -2489,7 +2491,29 @@ function createServer() {
         });
       }
 
-      // daily layer: top 3 by decay score
+      // diary layer: recent entries, prefer today_snapshot > title > content prefix
+      const diaryRows = await readMemoryRows({ layer: "diary", limit: 20 });
+      const recentDiaries = diaryRows
+        .map(denormalizeMemoryRow)
+        .filter((m) => m && !m._archived)
+        .sort((a, b) => {
+          const da = parseDateLike(a.date) ?? new Date(0);
+          const db = parseDateLike(b.date) ?? new Date(0);
+          return db.getTime() - da.getTime();
+        })
+        .slice(0, 3);
+      if (recentDiaries.length) {
+        sections.push({
+          label: "近期日记",
+          items: recentDiaries.map((m) => {
+            const snap = m.today_snapshot || m.title || String(m.content || "").slice(0, 40);
+            const datePrefix = m.date ? String(m.date).slice(0, 10) + " · " : "";
+            return (datePrefix + snap.trim()).trim();
+          }),
+        });
+      }
+
+      // daily layer: short-term items / reminders / temporary context (top 3 by decay score)
       const dailyRows = await readMemoryRows({ layer: "daily", limit: 50 });
       const allDailys = dailyRows
         .map(denormalizeMemoryRow)
