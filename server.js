@@ -2434,6 +2434,16 @@ function createServer() {
       if (keywords !== undefined) { cleanInput.keywords = keywords; updatedFields.push("keywords"); }
       if (profiles !== undefined) { cleanInput.profiles = profiles; updatedFields.push("profiles"); }
 
+      // Defensive: ensure newRaw carries existing protected/pinned state so the
+      // update path never resurrects a previously cleared flag, even if some
+      // future code path drops `!isUpdate` from buildMemoryRow's auto-inject guard.
+      if (newRaw.protected === undefined && existingRaw.protected !== undefined) {
+        newRaw.protected = existingRaw.protected;
+      }
+      if (newRaw.pinned === undefined && existingRaw.pinned !== undefined) {
+        newRaw.pinned = existingRaw.pinned;
+      }
+
       cleanInput.raw = newRaw;
       cleanInput.id = existing.id;
 
