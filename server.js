@@ -522,7 +522,7 @@ async function readMemoryRows({ layer, sub_layer, limit = 10, offset = 0 } = {})
 }
 
 function escapeOrValue(value) {
-  return String(value).replace(/[(),%*]/g, " ").trim();
+  return String(value).replace(/[(),%*_]/g, " ").trim();
 }
 
 async function queryMemoryRows({
@@ -1324,7 +1324,6 @@ async function buildRecallContext({
     const batches = await Promise.all([
       queryMemoryRows({ q: ql, layer, sub_layer, limit: batchLimit }),
       queryMemoryRows({ keywords: ql, layer, sub_layer, limit: batchLimit }),
-      readMemoryRows({ layer, sub_layer, limit: 2000 }),
     ]);
     const seen = new Set();
     for (const batch of batches) {
@@ -1964,14 +1963,13 @@ function createServer() {
       let rows;
       if (hasQuery) {
         const batchLimit = Math.min(300, cap * 10);
-        const [textRows, kwRows, recentRows] = await Promise.all([
+        const [textRows, kwRows] = await Promise.all([
           queryMemoryRows({ q, layer, sub_layer, limit: batchLimit }),
           queryMemoryRows({ keywords: q, layer, sub_layer, limit: batchLimit }),
-          readMemoryRows({ layer, sub_layer, limit: 500 }),
         ]);
         const seen = new Set();
         rows = [];
-        for (const r of [...textRows, ...kwRows, ...recentRows]) {
+        for (const r of [...textRows, ...kwRows]) {
           if (r?.id && !seen.has(r.id)) {
             seen.add(r.id);
             rows.push(r);
@@ -3361,9 +3359,6 @@ function createServer() {
         if (hasKw) {
           fetches.push(queryMemoryRows({ keywords, layer, sub_layer, limit: batchLimit }));
         }
-        // Supplement with all rows so memoryTextMatch can catch name/tags/domain/raw fields
-        // that DB queries don't cover. Gate below ensures only hits enter results.
-        fetches.push(readMemoryRows({ layer, sub_layer, limit: 2000 }));
         const batches = await Promise.all(fetches);
         const seen = new Set();
         rows = [];
@@ -3866,7 +3861,14 @@ app.delete("/api/memories/:id", requireFrontendAuth, async (req, res) => {
     const existing = await readMemoryById(id);
     if (!existing) return res.status(404).json({ error: "Not found" });
     const raw = { ...ensureObject(existing.raw, {}), _archived: true };
-    const saved = await updateMemoryRowById(id, { ...existing, raw });
+    const client = getSupabaseClient();
+    const { data: saved, error } = await client
+      .from(MEMORY_TABLE)
+      .update({ raw, _archived: true, updated_at: new Date().toISOString() })
+      .eq("id", id)
+      .select("*")
+      .maybeSingle();
+    if (error) throw toDbError("archive failed", error);
     log("info", "api", { route: "DELETE /api/memories/:id", id });
     res.json(denormalizeMemoryRow(saved));
   } catch (err) {
@@ -3901,7 +3903,14 @@ app.post("/api/memories/:id/restore", requireFrontendAuth, async (req, res) => {
     const existing = await readMemoryById(id);
     if (!existing) return res.status(404).json({ error: "Not found" });
     const raw = { ...ensureObject(existing.raw, {}), _archived: false };
-    const saved = await updateMemoryRowById(id, { ...existing, raw });
+    const client = getSupabaseClient();
+    const { data: saved, error } = await client
+      .from(MEMORY_TABLE)
+      .update({ raw, _archived: false, updated_at: new Date().toISOString() })
+      .eq("id", id)
+      .select("*")
+      .maybeSingle();
+    if (error) throw toDbError("restore failed", error);
     log("info", "api", { route: "POST /api/memories/:id/restore", id });
     res.json(denormalizeMemoryRow(saved));
   } catch (err) {
