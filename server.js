@@ -352,7 +352,7 @@ const RAW_COMPAT_FIELDS = [
   "last_active",
 ];
 
-function buildMemoryRow(input = {}) {
+function buildMemoryRow(input = {}, { isUpdate = false } = {}) {
   const layer = safeString(input.layer || "daily", STR_LIMITS.type).trim() || "daily";
   const content = safeString(input.content || "", STR_LIMITS.content);
   const importance = Math.round(clampNumber(input.importance, 1, 10, 2));
@@ -375,11 +375,17 @@ function buildMemoryRow(input = {}) {
   }
   if (!profiles.length) profiles = ["shared"];
 
-  const raw = ensureObject(input.raw, {});
+  // Shallow-copy so we never mutate the caller's raw object (which may still be
+  // referenced after this call returns).
+  const raw = { ...ensureObject(input.raw, {}) };
   for (const field of RAW_COMPAT_FIELDS) {
     if (input[field] !== undefined) raw[field] = input[field];
   }
+  // Auto-protect core/treasure/diary only when inserting a new row. On updates we
+  // must preserve whatever the existing record had, otherwise an unprotect can be
+  // silently reverted on the next edit.
   if (
+    !isUpdate &&
     input.protected === undefined &&
     raw.protected === undefined &&
     ["core", "treasure", "diary"].includes(layer)
@@ -1636,7 +1642,7 @@ function createServer() {
             if (args[field] !== undefined) mergedArgs.raw[field] = args[field];
           }
           mergedArgs.id = row.id;
-          const mergedRow = buildMemoryRow(mergedArgs);
+          const mergedRow = buildMemoryRow(mergedArgs, { isUpdate: true });
           saved = await updateMemoryRowById(row.id, mergedRow);
         } else {
           saved = await upsertMemoryRow(row);
@@ -2000,9 +2006,7 @@ function createServer() {
       }
 
       if (touch) {
-        for (const { m } of top) {
-          touchMemoryRow(m.id).catch(() => {});
-        }
+        await Promise.allSettled(top.map(({ m }) => touchMemoryRow(m.id)));
       }
 
       const total = await countMemoryRows();
@@ -2274,7 +2278,7 @@ function createServer() {
       mergeInput.raw = newRaw;
       mergeInput.id = existing.id;
 
-      const row = buildMemoryRow(mergeInput);
+      const row = buildMemoryRow(mergeInput, { isUpdate: true });
       // Force-preserve values that buildMemoryRow might not carry
       if (newRaw.pinned) row.raw.pinned = true;
       if (newRaw.protected) row.raw.protected = true;
@@ -2435,9 +2439,10 @@ function createServer() {
       cleanInput.raw = newRaw;
       cleanInput.id = existing.id;
 
-      const row = buildMemoryRow(cleanInput);
-      // buildMemoryRow doesn't carry digested or action-based _archived via top-level (we deleted them);
-      // newRaw is used as the raw base, so they're preserved — but double-write to be safe.
+      const row = buildMemoryRow(cleanInput, { isUpdate: true });
+      // newRaw is used as the raw base, so digested / _archived are already preserved
+      // there. Re-assert here so this code remains correct even if buildMemoryRow's
+      // raw handling changes (cheap, idempotent).
       if (digested !== undefined) row.raw.digested = digested;
       if (action === "archive") row.raw._archived = true;
       if (action === "restore") row.raw._archived = false;
@@ -2445,21 +2450,20 @@ function createServer() {
       if (pinned === true) row.raw.protected = true;
       else if (protectedFlag !== undefined) row.raw.protected = protectedFlag;
 
+      // Sync top-level status columns in the SAME update so raw and columns can't
+      // diverge. (_archived is raw-only — no top-level column on public.memories.)
+      if (resolved !== undefined) row.resolved = resolved;
+      if (digested !== undefined) row.digested = digested;
+      if (pinned !== undefined) {
+        row.pinned = pinned;
+        if (pinned) row.protected = true;
+        else if (protectedFlag !== undefined) row.protected = protectedFlag;
+      } else if (protectedFlag !== undefined) {
+        row.protected = protectedFlag;
+      }
+
       const saved = await updateMemoryRowById(existing.id, row);
       const item = denormalizeMemoryRow(saved) ?? denormalizeMemoryRow({ ...row, id: existing.id });
-
-      // Keep real top-level status columns in sync with raw for faster querying.
-      // _archived is intentionally raw-only because public.memories has no top-level _archived column.
-      try {
-        const topLevel = {};
-        if (resolved !== undefined) topLevel.resolved = resolved;
-        if (protectedFlag !== undefined) topLevel.protected = protectedFlag;
-        if (pinned !== undefined) { topLevel.pinned = pinned; if (pinned) topLevel.protected = true; }
-        if (digested !== undefined) topLevel.digested = digested;
-        if (Object.keys(topLevel).length) {
-          await getSupabaseClient().from(MEMORY_TABLE).update(topLevel).eq("id", existing.id);
-        }
-      } catch (_) {}
 
       log("info", "tool", {
         tool: "memory_trace",
@@ -2829,7 +2833,7 @@ function createServer() {
               delete cleanInput.digested;
               cleanInput.raw = newRaw;
               cleanInput.id = src.id;
-              const row = buildMemoryRow(cleanInput);
+              const row = buildMemoryRow(cleanInput, { isUpdate: true });
               row.raw.resolved = true;
               row.raw.digested = true;
               await updateMemoryRowById(src.id, row);
@@ -3845,7 +3849,7 @@ app.patch("/api/memories/:id", requireFrontendAuth, async (req, res) => {
       if (req.body[field] !== undefined) mergedRaw[field] = req.body[field];
     }
     const mergedInput = { ...existing, ...req.body, raw: mergedRaw, id };
-    const row = buildMemoryRow(mergedInput);
+    const row = buildMemoryRow(mergedInput, { isUpdate: true });
     const saved = await updateMemoryRowById(id, row);
     log("info", "api", { route: "PATCH /api/memories/:id", id });
     res.json(denormalizeMemoryRow(saved));
