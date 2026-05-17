@@ -1609,7 +1609,38 @@ function createServer() {
       let mode;
 
       if (row.id) {
-        saved = await upsertMemoryRow(row);
+        // Merge semantics: fetch existing so unspecified fields are preserved
+        const existing = await readMemoryById(row.id);
+        if (existing) {
+          const existingRaw = ensureObject(existing.raw, {});
+          // Base = existing DB fields; overlay only fields explicitly provided in args
+          const mergedArgs = {
+            layer: existing.layer,
+            sub_layer: existing.sub_layer,
+            title: existing.title,
+            content: existing.content,
+            importance: existing.importance,
+            date: existing.date,
+            author: existing.author,
+            mood: existing.mood,
+            keywords: existing.keywords,
+            profiles: existing.profiles,
+            legacy_id: existing.legacy_id,
+          };
+          for (const [k, v] of Object.entries(args)) {
+            if (v !== undefined && k !== "raw") mergedArgs[k] = v;
+          }
+          // Deep-merge raw: existing raw + args.raw, then overlay RAW_COMPAT_FIELDS from args
+          mergedArgs.raw = { ...existingRaw, ...ensureObject(args.raw, {}) };
+          for (const field of RAW_COMPAT_FIELDS) {
+            if (args[field] !== undefined) mergedArgs.raw[field] = args[field];
+          }
+          mergedArgs.id = row.id;
+          const mergedRow = buildMemoryRow(mergedArgs);
+          saved = await updateMemoryRowById(row.id, mergedRow);
+        } else {
+          saved = await upsertMemoryRow(row);
+        }
         mode = "upsert_by_id";
       } else if (row.legacy_id) {
         const existing = await readMemoryByLegacyId(row.legacy_id);
@@ -2061,6 +2092,7 @@ function createServer() {
         protected: z.boolean().optional(),
         importance: z.number().int().min(1).max(10).optional().default(2),
         date: z.string().optional(),
+        today_snapshot: z.string().optional(),
         merge: z.boolean().optional().default(true),
         threshold: z.number().min(0).max(1).optional().default(0.55),
         limit: z.number().int().min(1).max(100).optional().default(20),
@@ -2086,11 +2118,12 @@ function createServer() {
       protected: protectedFlag,
       importance = 2,
       date,
+      today_snapshot,
       merge = true,
       threshold = 0.55,
       limit = 20,
     }) => {
-      const inputRow = buildMemoryRow({ content, title, layer, sub_layer, author, mood, keywords, profiles, importance, date });
+      const inputRow = buildMemoryRow({ content, title, layer, sub_layer, author, mood, keywords, profiles, importance, date, today_snapshot });
 
       // Apply pinned/protected to inputRow (only-raise; pinned forces protected)
       if (pinned) { inputRow.raw.pinned = true; inputRow.raw.protected = true; }
@@ -2224,6 +2257,8 @@ function createServer() {
       // Apply incoming pinned/protected — only raise, never lower
       if (pinned) { newRaw.pinned = true; newRaw.protected = true; }
       else if (protectedFlag) { newRaw.protected = true; }
+      // today_snapshot: new value overrides existing when provided
+      if (today_snapshot !== undefined) newRaw.today_snapshot = today_snapshot;
 
       const mergeInput = { ...existing };
       // Strip top-level compat fields before buildMemoryRow to prevent override
