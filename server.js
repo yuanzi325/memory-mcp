@@ -522,7 +522,7 @@ async function readMemoryRows({ layer, sub_layer, limit = 10, offset = 0 } = {})
 }
 
 function escapeOrValue(value) {
-  return String(value).replace(/[(),%*_]/g, " ").trim();
+  return String(value).replace(/[(),%*_\\'"]/g, " ").trim();
 }
 
 async function queryMemoryRows({
