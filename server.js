@@ -1606,6 +1606,7 @@ function createServer() {
         total_memories: z.number(),
         updated_at: z.string(),
         mode: z.string(),
+        hint: z.string().optional(),
       }),
     },
     async (args) => {
@@ -1669,6 +1670,9 @@ function createServer() {
         updated_at: item?.updated_at || new Date().toISOString(),
         mode,
       };
+      if (row.layer === "diary" && !row.raw?.chord_tag) {
+        result.hint = "chord_tag 未填写——今天的情绪是什么调？";
+      }
 
       log("info", "tool", {
         tool: "memory_write",
