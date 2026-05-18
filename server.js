@@ -522,7 +522,7 @@ async function readMemoryRows({ layer, sub_layer, limit = 10, offset = 0 } = {})
 }
 
 function escapeOrValue(value) {
-  return String(value).replace(/[(),%*_\\'"]/g, " ").trim();
+  return String(value).replace(/[(),%*_.\\'"]/g, " ").trim();
 }
 
 async function queryMemoryRows({
@@ -1651,7 +1651,31 @@ function createServer() {
       } else if (row.legacy_id) {
         const existing = await readMemoryByLegacyId(row.legacy_id);
         if (existing?.id) {
-          saved = await updateMemoryRowById(existing.id, row);
+          // Same merge-preserve logic as the id path: base = existing, overlay args
+          const existingRaw = ensureObject(existing.raw, {});
+          const mergedArgs = {
+            layer: existing.layer,
+            sub_layer: existing.sub_layer,
+            title: existing.title,
+            content: existing.content,
+            importance: existing.importance,
+            date: existing.date,
+            author: existing.author,
+            mood: existing.mood,
+            keywords: existing.keywords,
+            profiles: existing.profiles,
+            legacy_id: existing.legacy_id,
+          };
+          for (const [k, v] of Object.entries(args)) {
+            if (v !== undefined && k !== "raw") mergedArgs[k] = v;
+          }
+          mergedArgs.raw = { ...existingRaw, ...ensureObject(args.raw, {}) };
+          for (const field of RAW_COMPAT_FIELDS) {
+            if (args[field] !== undefined) mergedArgs.raw[field] = args[field];
+          }
+          mergedArgs.id = existing.id;
+          const mergedRow = buildMemoryRow(mergedArgs, { isUpdate: true });
+          saved = await updateMemoryRowById(existing.id, mergedRow);
           mode = "update_by_legacy_id";
         } else {
           saved = await insertMemoryRow(row);
