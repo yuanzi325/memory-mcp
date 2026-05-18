@@ -3850,7 +3850,30 @@ app.post("/api/memories", requireFrontendAuth, async (req, res) => {
     } else if (row.legacy_id) {
       const existing = await readMemoryByLegacyId(row.legacy_id);
       if (existing?.id) {
-        saved = await updateMemoryRowById(existing.id, row);
+        const existingRaw = ensureObject(existing.raw, {});
+        const mergedArgs = {
+          layer: existing.layer,
+          sub_layer: existing.sub_layer,
+          title: existing.title,
+          content: existing.content,
+          importance: existing.importance,
+          date: existing.date,
+          author: existing.author,
+          mood: existing.mood,
+          keywords: existing.keywords,
+          profiles: existing.profiles,
+          legacy_id: existing.legacy_id,
+        };
+        for (const [k, v] of Object.entries(req.body)) {
+          if (v !== undefined && k !== "raw") mergedArgs[k] = v;
+        }
+        mergedArgs.raw = { ...existingRaw, ...ensureObject(req.body.raw, {}) };
+        for (const field of RAW_COMPAT_FIELDS) {
+          if (req.body[field] !== undefined) mergedArgs.raw[field] = req.body[field];
+        }
+        mergedArgs.id = existing.id;
+        const mergedRow = buildMemoryRow(mergedArgs, { isUpdate: true });
+        saved = await updateMemoryRowById(existing.id, mergedRow);
         mode = "update_by_legacy_id";
       } else {
         saved = await insertMemoryRow(row);
