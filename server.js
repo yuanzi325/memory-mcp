@@ -424,6 +424,16 @@ function buildMemoryRow(input = {}, { isUpdate = false } = {}) {
   return row;
 }
 
+const RAW_COLUMN_SYNC = ["resolved", "pinned", "protected", "digested", "activation_count", "last_active", "valence", "arousal"];
+
+function syncRawToColumns(row) {
+  const raw = row.raw;
+  if (!raw) return;
+  for (const field of RAW_COLUMN_SYNC) {
+    if (raw[field] !== undefined) row[field] = raw[field];
+  }
+}
+
 function denormalizeMemoryRow(row) {
   if (!row) return null;
   const raw = ensureObject(row.raw, {});
@@ -2166,19 +2176,9 @@ function createServer() {
             applyBucketFields(inputRow, bucket);
           } catch (_) {}
         }
+        syncRawToColumns(inputRow);
         const saved = await insertMemoryRow(inputRow);
         const item = denormalizeMemoryRow(saved);
-        if (item?.id && (pinned || protectedFlag)) {
-          try {
-            await getSupabaseClient()
-              .from(MEMORY_TABLE)
-              .update({
-                pinned: Boolean(inputRow.raw.pinned),
-                protected: Boolean(inputRow.raw.protected),
-              })
-              .eq("id", item.id);
-          } catch (_) {}
-        }
         log("info", "tool", {
           tool: "memory_hold",
           mode: "created",
@@ -2229,19 +2229,9 @@ function createServer() {
             applyBucketFields(inputRow, bucket);
           } catch (_) {}
         }
+        syncRawToColumns(inputRow);
         const saved = await insertMemoryRow(inputRow);
         const item = denormalizeMemoryRow(saved);
-        if (item?.id && (pinned || protectedFlag)) {
-          try {
-            await getSupabaseClient()
-              .from(MEMORY_TABLE)
-              .update({
-                pinned: Boolean(inputRow.raw.pinned),
-                protected: Boolean(inputRow.raw.protected),
-              })
-              .eq("id", item.id);
-          } catch (_) {}
-        }
         log("info", "tool", {
           tool: "memory_hold",
           mode: "created",
@@ -2326,26 +2316,11 @@ function createServer() {
         } catch (_) {}
       }
 
+      syncRawToColumns(row);
       const saved = await updateMemoryRowById(existing.id, row);
       const item =
         denormalizeMemoryRow(saved) ??
         denormalizeMemoryRow({ ...row, id: existing.id });
-
-      // Attempt top-level compat column sync
-      try {
-        await getSupabaseClient()
-          .from(MEMORY_TABLE)
-          .update({
-            activation_count: newRaw.activation_count,
-            last_active: now,
-            updated_at: now,
-            pinned: Boolean(newRaw.pinned),
-            protected: Boolean(newRaw.protected),
-            resolved: Boolean(newRaw.resolved ?? existing.resolved),
-            digested: Boolean(newRaw.digested ?? existing.digested),
-          })
-          .eq("id", existing.id);
-      } catch (_) {}
 
       log("info", "tool", {
         tool: "memory_hold",
@@ -2872,13 +2847,8 @@ function createServer() {
               const row = buildMemoryRow(cleanInput, { isUpdate: true });
               row.raw.resolved = true;
               row.raw.digested = true;
+              syncRawToColumns(row);
               await updateMemoryRowById(src.id, row);
-              try {
-                await getSupabaseClient()
-                  .from(MEMORY_TABLE)
-                  .update({ resolved: true, digested: true })
-                  .eq("id", src.id);
-              } catch (_) {}
               markedCount++;
             } catch (_) {}
           })
@@ -3845,8 +3815,39 @@ app.post("/api/memories", requireFrontendAuth, async (req, res) => {
     let saved;
     let mode;
     if (row.id) {
-      saved = await upsertMemoryRow(row);
-      mode = "upsert_by_id";
+      const existing = await readMemoryById(row.id);
+      if (existing) {
+        const existingRaw = ensureObject(existing.raw, {});
+        const mergedArgs = {
+          layer: existing.layer,
+          sub_layer: existing.sub_layer,
+          title: existing.title,
+          content: existing.content,
+          importance: existing.importance,
+          date: existing.date,
+          author: existing.author,
+          mood: existing.mood,
+          keywords: existing.keywords,
+          profiles: existing.profiles,
+          legacy_id: existing.legacy_id,
+        };
+        for (const [k, v] of Object.entries(req.body)) {
+          if (v !== undefined && k !== "raw") mergedArgs[k] = v;
+        }
+        mergedArgs.raw = { ...existingRaw, ...ensureObject(req.body.raw, {}) };
+        for (const field of RAW_COMPAT_FIELDS) {
+          if (req.body[field] !== undefined) mergedArgs.raw[field] = req.body[field];
+        }
+        mergedArgs.id = existing.id;
+        const mergedRow = buildMemoryRow(mergedArgs, { isUpdate: true });
+        syncRawToColumns(mergedRow);
+        saved = await updateMemoryRowById(existing.id, mergedRow);
+        mode = "update_by_id";
+      } else {
+        syncRawToColumns(row);
+        saved = await upsertMemoryRow(row);
+        mode = "upsert_by_id";
+      }
     } else if (row.legacy_id) {
       const existing = await readMemoryByLegacyId(row.legacy_id);
       if (existing?.id) {
