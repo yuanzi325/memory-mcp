@@ -654,14 +654,18 @@ async function touchMemoryRow(id) {
       .select("raw, activation_count, last_active")
       .eq("id", id)
       .maybeSingle();
-    if (error || !row) return;
+    if (error) {
+      log("warn", "memory", { event: "touch_memory_row_select_failed", id, message: error.message || String(error) });
+      return;
+    }
+    if (!row) return;
     const raw = ensureObject(row.raw, {});
     const currentCount = raw.activation_count ?? row.activation_count ?? 0;
     const numericCount = Number(currentCount);
     const nextCount = Number.isFinite(numericCount) ? numericCount + 1 : 1;
     const now = new Date().toISOString();
     log("info", "memory", { event: "touch_memory_row", id, current_count: numericCount, next_count: nextCount });
-    await client
+    const { error: updateError } = await client
       .from(MEMORY_TABLE)
       .update({
         raw: { ...raw, activation_count: nextCount, last_active: now },
@@ -670,7 +674,12 @@ async function touchMemoryRow(id) {
         updated_at: now,
       })
       .eq("id", id);
-  } catch (_) {}
+    if (updateError) {
+      log("warn", "memory", { event: "touch_memory_row_update_failed", id, message: updateError.message || String(updateError) });
+    }
+  } catch (err) {
+    log("warn", "memory", { event: "touch_memory_row_exception", id, message: err instanceof Error ? err.message : String(err) });
+  }
 }
 
 async function readMemoryRowsByBucketId(bucketId, { limit = 500 } = {}) {
@@ -1653,8 +1662,10 @@ function createServer() {
           }
           mergedArgs.id = row.id;
           const mergedRow = buildMemoryRow(mergedArgs, { isUpdate: true });
+          syncRawToColumns(mergedRow);
           saved = await updateMemoryRowById(row.id, mergedRow);
         } else {
+          syncRawToColumns(row);
           saved = await upsertMemoryRow(row);
         }
         mode = "upsert_by_id";
@@ -1685,13 +1696,16 @@ function createServer() {
           }
           mergedArgs.id = existing.id;
           const mergedRow = buildMemoryRow(mergedArgs, { isUpdate: true });
+          syncRawToColumns(mergedRow);
           saved = await updateMemoryRowById(existing.id, mergedRow);
           mode = "update_by_legacy_id";
         } else {
+          syncRawToColumns(row);
           saved = await insertMemoryRow(row);
           mode = "insert";
         }
       } else {
+        syncRawToColumns(row);
         saved = await insertMemoryRow(row);
         mode = "insert";
       }
@@ -2463,6 +2477,7 @@ function createServer() {
 
       // Sync top-level status columns in the SAME update so raw and columns can't
       // diverge. (_archived is raw-only — no top-level column on public.memories.)
+      syncRawToColumns(row);
       if (resolved !== undefined) row.resolved = resolved;
       if (digested !== undefined) row.digested = digested;
       if (pinned !== undefined) {
@@ -2828,6 +2843,7 @@ function createServer() {
         } catch (_) {}
       }
 
+      syncRawToColumns(condensedRow);
       const savedCondensed = await insertMemoryRow(condensedRow);
       const item = denormalizeMemoryRow(savedCondensed);
 
@@ -3874,13 +3890,16 @@ app.post("/api/memories", requireFrontendAuth, async (req, res) => {
         }
         mergedArgs.id = existing.id;
         const mergedRow = buildMemoryRow(mergedArgs, { isUpdate: true });
+        syncRawToColumns(mergedRow);
         saved = await updateMemoryRowById(existing.id, mergedRow);
         mode = "update_by_legacy_id";
       } else {
+        syncRawToColumns(row);
         saved = await insertMemoryRow(row);
         mode = "insert";
       }
     } else {
+      syncRawToColumns(row);
       saved = await insertMemoryRow(row);
       mode = "insert";
     }
@@ -3907,6 +3926,7 @@ app.patch("/api/memories/:id", requireFrontendAuth, async (req, res) => {
     }
     const mergedInput = { ...existing, ...req.body, raw: mergedRaw, id };
     const row = buildMemoryRow(mergedInput, { isUpdate: true });
+    syncRawToColumns(row);
     const saved = await updateMemoryRowById(id, row);
     log("info", "api", { route: "PATCH /api/memories/:id", id });
     res.json(denormalizeMemoryRow(saved));
