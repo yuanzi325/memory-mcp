@@ -544,6 +544,7 @@ async function queryMemoryRows({
   min_importance,
   max_importance,
   limit = 10,
+  offset = 0,
 } = {}) {
   const client = getSupabaseClient();
   let query = client.from(MEMORY_TABLE).select("*");
@@ -592,7 +593,8 @@ async function queryMemoryRows({
   // Fetch with headroom so JS-side raw->_archived/_resolved filters can still
   // satisfy `limit` after dropping a few rows.
   const cap = Math.max(1, Math.min(2000, (Number(limit) || 10) * 3));
-  query = query.limit(cap);
+  const off = Math.max(0, Number(offset) || 0);
+  query = query.range(off, off + cap - 1);
 
   const { data, error } = await query;
   if (error) throw toDbError("Supabase queryMemoryRows failed", error);
@@ -645,6 +647,9 @@ async function countMemoryRows() {
   return typeof count === "number" ? count : 0;
 }
 
+// NOTE: non-atomic read-modify-write; concurrent touches on the same id can
+// lose increments. Atomic fix needs a DB RPC (e.g. PL/pgSQL UPDATE ... RETURNING
+// activation_count = activation_count + 1) — known residue, out of scope.
 async function touchMemoryRow(id) {
   if (!isValidUuid(id)) return;
   try {
@@ -3796,7 +3801,7 @@ app.get("/api/memories", requireFrontendAuth, async (req, res) => {
     const fetchLimit = includeArchived ? limit + 1 : limit * 3;
     let rows;
     if (q && String(q).trim()) {
-      rows = await queryMemoryRows({ q, layer, sub_layer, limit: fetchLimit });
+      rows = await queryMemoryRows({ q, layer, sub_layer, limit: fetchLimit, offset });
     } else {
       rows = await readMemoryRows({ layer, sub_layer, limit: fetchLimit, offset });
     }
@@ -4105,7 +4110,7 @@ app.all("/mcp", async (req, res) => {
       };
 
       await server.connect(transport);
-      session = { server, transport };
+      session = { server, transport, createdAt: Date.now(), lastSeen: Date.now() };
     }
 
     // Ensure both MIME types are present so StreamableHTTPServerTransport
@@ -4120,10 +4125,12 @@ app.all("/mcp", async (req, res) => {
       }
     }
 
+    session.lastSeen = Date.now();
     await session.transport.handleRequest(req, res, req.body);
 
     const activeSessionId = session.transport.sessionId;
     if (activeSessionId) {
+      session.lastSeen = Date.now();
       sessions.set(activeSessionId, session);
     }
   } catch (error) {
@@ -4161,6 +4168,31 @@ setInterval(() => {
     if (now > v.expiresAt) pendingAuths.delete(k);
   }
 }, 60_000).unref();
+
+const MCP_SESSION_IDLE_TTL_MS = (() => {
+  const raw = Number(process.env.MCP_SESSION_IDLE_TTL_MS);
+  if (Number.isFinite(raw) && raw > 0) return Math.floor(raw);
+  return 6 * 60 * 60 * 1000; // default: 6h
+})();
+
+setInterval(() => {
+  const now = Date.now();
+  const stale = [];
+  for (const [id, sess] of sessions.entries()) {
+    const lastSeen = Number(sess?.lastSeen) || Number(sess?.createdAt) || 0;
+    if (lastSeen && now - lastSeen > MCP_SESSION_IDLE_TTL_MS) stale.push(id);
+  }
+  for (const id of stale) {
+    log("info", "session", { event: "idle_session_evicted", sessionId: id, ttl_ms: MCP_SESSION_IDLE_TTL_MS });
+    closeSession(id).catch((err) => {
+      log("warn", "session", {
+        event: "idle_session_evict_failed",
+        sessionId: id,
+        message: err instanceof Error ? err.message : String(err),
+      });
+    });
+  }
+}, 5 * 60_000).unref();
 
 app.get("/.well-known/oauth-protected-resource", (req, res) => {
   if (!hasOAuthConfig()) {
@@ -4411,7 +4443,29 @@ const httpServer = app.listen(PORT, () => {
 });
 
 async function shutdown() {
-  httpServer.close();
+  await new Promise((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      log("warn", "server", { event: "shutdown_http_close_timeout", timeout_ms: 5000 });
+      finish();
+    }, 5000);
+    timer.unref?.();
+    httpServer.close((err) => {
+      clearTimeout(timer);
+      if (err) {
+        log("warn", "server", {
+          event: "shutdown_http_close_failed",
+          message: err instanceof Error ? err.message : String(err),
+        });
+      }
+      finish();
+    });
+  });
 
   for (const sessionId of sessions.keys()) {
     await closeSession(sessionId);
