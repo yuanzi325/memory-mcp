@@ -2138,6 +2138,7 @@ function createServer() {
         importance: z.number().int().min(1).max(10).optional().default(2),
         date: z.string().optional(),
         today_snapshot: z.string().optional(),
+        chord_tag: z.string().optional(),
         merge: z.boolean().optional().default(true),
         threshold: z.number().min(0).max(1).optional().default(0.55),
         limit: z.number().int().min(1).max(100).optional().default(20),
@@ -2164,6 +2165,7 @@ function createServer() {
       importance = 2,
       date,
       today_snapshot,
+      chord_tag,
       merge = true,
       threshold = 0.55,
       limit = 20,
@@ -2173,6 +2175,10 @@ function createServer() {
       // Apply pinned/protected to inputRow (only-raise; pinned forces protected)
       if (pinned) { inputRow.raw.pinned = true; inputRow.raw.protected = true; }
       else if (protectedFlag) { inputRow.raw.protected = true; }
+      // chord_tag: only persist for diary/treasure; ignored on other layers
+      if (chord_tag !== undefined && (layer === "diary" || layer === "treasure")) {
+        inputRow.raw.chord_tag = chord_tag;
+      }
 
       if (!merge) {
         if (!inputRow.bucket_id) {
