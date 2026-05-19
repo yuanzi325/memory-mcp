@@ -2290,6 +2290,11 @@ function createServer() {
       else if (protectedFlag) { newRaw.protected = true; }
       // today_snapshot: new value overrides existing when provided
       if (today_snapshot !== undefined) newRaw.today_snapshot = today_snapshot;
+      // chord_tag: only overlay for diary/treasure; trim-empty deletes
+      if (chord_tag !== undefined && (layer === "diary" || layer === "treasure")) {
+        if (chord_tag.trim()) newRaw.chord_tag = chord_tag;
+        else delete newRaw.chord_tag;
+      }
 
       const mergeInput = { ...existing };
       // Strip top-level compat fields before buildMemoryRow to prevent override
