@@ -1572,7 +1572,14 @@ function createServer() {
     "memory_write",
     {
       title: "Memory Write",
-      description: "Write one memory item into the Supabase public.memories table.",
+      description:
+        "Write one memory item into the Supabase public.memories table. " +
+        "Field semantics — " +
+        "content：日记/记录正文，按 author 视角写，谁写都可以；author 是小克时，小克自己的状态写在 content。" +
+        "today_snapshot = 沅沅今天的状态摘要，用于前端「今天的你」与 briefing；" +
+        "即使 author 是小克，today_snapshot 也不要写成小克自己的状态。" +
+        "chord_tag（写入 raw.chord_tag）= 这条 diary / treasure 记录的可选情绪和弦；" +
+        "不要为 daily / memo / core / health 等其他 layer 写 chord_tag。",
       inputSchema: z.object({
         content: z.string().min(1),
         layer: z.string().optional(),
@@ -1697,7 +1704,7 @@ function createServer() {
         mode,
       };
       if (row.layer === "diary" && !row.raw?.chord_tag) {
-        result.hint = "chord_tag 未填写——今天的情绪是什么调？";
+        result.hint = "chord_tag（可选）= 这条 diary 记录的情绪和弦；今天的情绪是什么调？可不填。";
       }
 
       log("info", "tool", {
@@ -2110,7 +2117,13 @@ function createServer() {
         "Write a new memory or merge into an existing similar one. " +
         "Uses lightweight keyword/title/content similarity scoring (no embeddings). " +
         "If the best candidate scores >= threshold the new content is appended to that memory; " +
-        "otherwise a new memory is created.",
+        "otherwise a new memory is created. " +
+        "Field semantics — " +
+        "content：日记/记录正文，按 author 视角写，谁写都可以；author 是小克时，小克自己的状态写在 content。" +
+        "today_snapshot = 沅沅今天的状态摘要，用于前端「今天的你」与 briefing；" +
+        "即使 author 是小克，today_snapshot 也不要写成小克自己的状态。" +
+        "chord_tag（写入 raw.chord_tag）= 这条 diary / treasure 记录的可选情绪和弦；" +
+        "不要为 daily / memo / core / health 等其他 layer 写 chord_tag。",
       inputSchema: z.object({
         content: z.string().min(1),
         title: z.string().optional(),
@@ -2496,7 +2509,8 @@ function createServer() {
       title: "Memory Briefing",
       description:
         "Return a compact briefing assembled from memo, diary, and daily memories. " +
-        "diary = 每日主记录（叙事/情绪/生活片段），briefing 优先显示其 today_snapshot；" +
+        "diary = 每日主记录（叙事/情绪/生活片段），briefing 优先读取 diary.today_snapshot —— " +
+        "today_snapshot 表示沅沅今日状态，不是 diary 作者（即使 author 是小克）自己的状态摘要；" +
         "daily = 短期事项/临时上下文/提醒，不再作为每日自动记录与 diary 重复。" +
         "Intended to be injected once per session at the start of a conversation " +
         "so the model is aware of recent context without manual querying.",
