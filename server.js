@@ -647,40 +647,13 @@ async function countMemoryRows() {
   return typeof count === "number" ? count : 0;
 }
 
-// NOTE: non-atomic read-modify-write; concurrent touches on the same id can
-// lose increments. Atomic fix needs a DB RPC (e.g. PL/pgSQL UPDATE ... RETURNING
-// activation_count = activation_count + 1) — known residue, out of scope.
 async function touchMemoryRow(id) {
   if (!isValidUuid(id)) return;
   try {
     const client = getSupabaseClient();
-    const { data: row, error } = await client
-      .from(MEMORY_TABLE)
-      .select("raw, activation_count, last_active")
-      .eq("id", id)
-      .maybeSingle();
+    const { error } = await client.rpc("touch_memory_row", { p_id: id });
     if (error) {
-      log("warn", "memory", { event: "touch_memory_row_select_failed", id, message: error.message || String(error) });
-      return;
-    }
-    if (!row) return;
-    const raw = ensureObject(row.raw, {});
-    const currentCount = raw.activation_count ?? row.activation_count ?? 0;
-    const numericCount = Number(currentCount);
-    const nextCount = Number.isFinite(numericCount) ? numericCount + 1 : 1;
-    const now = new Date().toISOString();
-    log("info", "memory", { event: "touch_memory_row", id, current_count: numericCount, next_count: nextCount });
-    const { error: updateError } = await client
-      .from(MEMORY_TABLE)
-      .update({
-        raw: { ...raw, activation_count: nextCount, last_active: now },
-        activation_count: nextCount,
-        last_active: now,
-        updated_at: now,
-      })
-      .eq("id", id);
-    if (updateError) {
-      log("warn", "memory", { event: "touch_memory_row_update_failed", id, message: updateError.message || String(updateError) });
+      log("warn", "memory", { event: "touch_memory_row_rpc_failed", id, message: error.message || String(error) });
     }
   } catch (err) {
     log("warn", "memory", { event: "touch_memory_row_exception", id, message: err instanceof Error ? err.message : String(err) });
