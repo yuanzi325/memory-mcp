@@ -2396,7 +2396,7 @@ function createServer() {
         "Update memory state after memory_surface surfacing. " +
         "Supports marking resolved / digested / pinned, archiving / restoring, " +
         "and patching importance, content, keywords, profiles, and title." +
-        " English aliases: trace memory, source memories, memory lineage, link memories.",
+        " English aliases: update memory state, mark memory resolved, mark memory digested, pin memory, archive memory, restore memory.",
       inputSchema: z.object({
         id: z.string(),
         resolved: z.boolean().optional(),
