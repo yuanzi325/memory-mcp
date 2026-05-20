@@ -1595,6 +1595,7 @@ function createServer() {
         profiles: z.union([z.array(z.string()), z.string()]).optional(),
         why_precious: z.string().optional(),
         today_snapshot: z.string().optional(),
+        chord_tag: z.string().optional(),
         resolved: z.boolean().optional(),
         pinned: z.boolean().optional(),
         protected: z.boolean().optional(),
@@ -1615,6 +1616,11 @@ function createServer() {
     },
     async (args) => {
       const row = buildMemoryRow(args);
+      const chordTag = args.chord_tag;
+      if (chordTag !== undefined && (row.layer === "diary" || row.layer === "treasure")) {
+        if (chordTag.trim()) row.raw.chord_tag = chordTag;
+        else delete row.raw.chord_tag;
+      }
       let saved;
       let mode;
 
@@ -2177,7 +2183,8 @@ function createServer() {
       else if (protectedFlag) { inputRow.raw.protected = true; }
       // chord_tag: only persist for diary/treasure; ignored on other layers
       if (chord_tag !== undefined && (layer === "diary" || layer === "treasure")) {
-        inputRow.raw.chord_tag = chord_tag;
+        if (chord_tag.trim()) inputRow.raw.chord_tag = chord_tag;
+        else delete inputRow.raw.chord_tag;
       }
 
       if (!merge) {
