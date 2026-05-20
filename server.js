@@ -457,6 +457,7 @@ function denormalizeMemoryRow(row) {
     bucket_type: row.bucket_type ?? raw.bucket_type ?? "",
     why_precious: typeof raw.why_precious === "string" ? raw.why_precious : "",
     today_snapshot: typeof raw.today_snapshot === "string" ? raw.today_snapshot : "",
+    chord_tag: typeof raw.chord_tag === "string" ? raw.chord_tag : "",
     resolved: raw.resolved ?? row.resolved ?? false,
     pinned: raw.pinned ?? row.pinned ?? false,
     protected: raw.protected ?? row.protected ?? false,
@@ -698,6 +699,9 @@ function formatMemoryForModel(memory = {}, snippetLength = 0) {
   if (memory.date) lines.push(`date: ${memory.date}`);
   if (memory.author) lines.push(`author: ${memory.author}`);
   if (memory.mood) lines.push(`mood: ${memory.mood}`);
+  if (memory.chord_tag || memory.raw?.chord_tag) {
+    lines.push(`chord_tag: ${memory.chord_tag || memory.raw.chord_tag}`);
+  }
   if (memory.keywords?.length) lines.push(`keywords: ${memory.keywords.join(", ")}`);
 
   function snippet(text, limit) {
@@ -726,6 +730,7 @@ const memoryRecordSchema = z
     content: z.string(),
     why_precious: z.string().optional().default(""),
     today_snapshot: z.string().optional().default(""),
+    chord_tag: z.string().optional().default(""),
     importance: z.number(),
     activation_count: z.number().optional(),
     last_active: z.string().optional(),
