@@ -1653,6 +1653,10 @@ function createServer() {
           }
           mergedArgs.id = row.id;
           const mergedRow = buildMemoryRow(mergedArgs, { isUpdate: true });
+          if (chordTag !== undefined && (mergedRow.layer === "diary" || mergedRow.layer === "treasure")) {
+            if (chordTag.trim()) mergedRow.raw.chord_tag = chordTag;
+            else delete mergedRow.raw.chord_tag;
+          }
           syncRawToColumns(mergedRow);
           saved = await updateMemoryRowById(row.id, mergedRow);
         } else {
@@ -1687,6 +1691,10 @@ function createServer() {
           }
           mergedArgs.id = existing.id;
           const mergedRow = buildMemoryRow(mergedArgs, { isUpdate: true });
+          if (chordTag !== undefined && (mergedRow.layer === "diary" || mergedRow.layer === "treasure")) {
+            if (chordTag.trim()) mergedRow.raw.chord_tag = chordTag;
+            else delete mergedRow.raw.chord_tag;
+          }
           syncRawToColumns(mergedRow);
           saved = await updateMemoryRowById(existing.id, mergedRow);
           mode = "update_by_legacy_id";
