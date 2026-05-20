@@ -1584,7 +1584,8 @@ function createServer() {
         "today_snapshot = 沅沅今天的状态摘要，用于前端「今天的你」与 briefing；" +
         "即使 author 是小克，today_snapshot 也不要写成小克自己的状态。" +
         "chord_tag（写入 raw.chord_tag）= 这条 diary / treasure 记录的可选情绪和弦；" +
-        "不要为 daily / memo / core / health 等其他 layer 写 chord_tag。",
+        "不要为 daily / memo / core / health 等其他 layer 写 chord_tag。" +
+        " English aliases: save memory, write memory, create memory, update memory, diary entry, treasure memory.",
       inputSchema: z.object({
         content: z.string().min(1),
         layer: z.string().optional(),
@@ -1759,7 +1760,8 @@ function createServer() {
     {
       title: "Memory Read",
       description:
-        "Read one memory by id (uuid or legacy_id), or read the latest memories from the Supabase public.memories table.",
+        "Read one memory by id (uuid or legacy_id), or read the latest memories from the Supabase public.memories table." +
+        " English aliases: read memory, get memory, list memories, fetch memory by id.",
       inputSchema: z.object({
         id: z.string().optional(),
         layer: z.string().optional(),
@@ -1838,7 +1840,8 @@ function createServer() {
     {
       title: "Memory Query",
       description:
-        "Search memories by keyword, layer, sub_layer, author, keywords, or importance from the Supabase public.memories table.",
+        "Search memories by keyword, layer, sub_layer, author, keywords, or importance from the Supabase public.memories table." +
+        " English aliases: search memory, query memories, memory search, find memories.",
       inputSchema: z.object({
         q: z.string().optional().default(""),
         layer: z.string().optional(),
@@ -1935,7 +1938,8 @@ function createServer() {
         "Surface memories using an OB-style algorithm that scores by importance, recency, arousal, " +
         "activation count, and pinned/protected status. Pinned memories appear first. Resolved memories " +
         "are down-weighted. High-arousal unresolved memories are boosted. Optionally accepts a query to " +
-        "text-search first, then re-rank by weighted score.",
+        "text-search first, then re-rank by weighted score." +
+        " English aliases: surface memories, active memories, top memories, ranked memories.",
       inputSchema: z.object({
         q: z.string().optional().default(""),
         profile: z.enum(["shared", "rowan", "arion", "all"]).optional().default("shared"),
@@ -2142,7 +2146,8 @@ function createServer() {
         "today_snapshot = 沅沅今天的状态摘要，用于前端「今天的你」与 briefing；" +
         "即使 author 是小克，today_snapshot 也不要写成小克自己的状态。" +
         "chord_tag（写入 raw.chord_tag）= 这条 diary / treasure 记录的可选情绪和弦；" +
-        "不要为 daily / memo / core / health 等其他 layer 写 chord_tag。",
+        "不要为 daily / memo / core / health 等其他 layer 写 chord_tag。" +
+        " English aliases: hold memory, merge memory, upsert memory, deduplicate memory, save or merge memory.",
       inputSchema: z.object({
         content: z.string().min(1),
         title: z.string().optional(),
@@ -2390,7 +2395,8 @@ function createServer() {
       description:
         "Update memory state after memory_surface surfacing. " +
         "Supports marking resolved / digested / pinned, archiving / restoring, " +
-        "and patching importance, content, keywords, profiles, and title.",
+        "and patching importance, content, keywords, profiles, and title." +
+        " English aliases: trace memory, source memories, memory lineage, link memories.",
       inputSchema: z.object({
         id: z.string(),
         resolved: z.boolean().optional(),
@@ -2544,7 +2550,8 @@ function createServer() {
         "today_snapshot 表示沅沅今日状态，不是 diary 作者（即使 author 是小克）自己的状态摘要；" +
         "daily = 短期事项/临时上下文/提醒，不再作为每日自动记录与 diary 重复。" +
         "Intended to be injected once per session at the start of a conversation " +
-        "so the model is aware of recent context without manual querying.",
+        "so the model is aware of recent context without manual querying." +
+        " English aliases: session briefing, memory briefing, startup context, handoff summary, recent context.",
       inputSchema: z.object({}),
       outputSchema: z.object({
         sections: z.array(
@@ -2656,7 +2663,8 @@ function createServer() {
       description:
         "Consolidate a batch of fragmented memories into one long-term condensed memory, " +
         "then mark sources as resolved+digested to keep the pool clean. " +
-        "Use dry_run=true (default) to preview candidates before committing.",
+        "Use dry_run=true (default) to preview candidates before committing." +
+        " English aliases: digest memory, summarize memory, condense memory, mark digested.",
       inputSchema: z.object({
         source_ids: z.array(z.string()).optional(),
         q: z.string().optional(),
@@ -3024,7 +3032,8 @@ function createServer() {
         "Read-only. Aggregate memories by bucket and return cluster statistics " +
         "(memory_count, open_count, resolved_count, pinned_count, protected_count, " +
         "max_importance, last_active, score, sample_ids, sample_titles). " +
-        "Useful for discovering active topic clusters without reading every memory.",
+        "Useful for discovering active topic clusters without reading every memory." +
+        " English aliases: memory bucket, cluster memories, topic bucket, memory grouping, surface buckets.",
       inputSchema: z.object({
         q: z.string().optional(),
         profile: z.enum(["shared", "rowan", "arion", "all"]).optional().default("shared"),
@@ -3172,7 +3181,8 @@ function createServer() {
       title: "Memory Bucket Read",
       description:
         "Read-only. List memories belonging to a specific bucket_id, " +
-        "sorted by pinned > protected > importance > last_active. Does not touch/update records.",
+        "sorted by pinned > protected > importance > last_active. Does not touch/update records." +
+        " English aliases: read bucket, list bucket memories, bucket contents, cluster contents.",
       inputSchema: z.object({
         bucket_id: z.string().min(1),
         include_resolved: z.boolean().optional().default(true),
@@ -3230,7 +3240,8 @@ function createServer() {
         "rename: update the name field on all non-archived memories in the bucket. " +
         "retag: merge new tags into all non-archived memories in the bucket. " +
         "merge: reassign all non-archived memories from source bucket to target_bucket_id. " +
-        "Never deletes records or changes content/resolved/digested/_archived status.",
+        "Never deletes records or changes content/resolved/digested/_archived status." +
+        " English aliases: rename bucket, retag bucket, merge buckets, manage bucket, edit cluster.",
       inputSchema: z.object({
         bucket_id: z.string().min(1),
         action: z.enum(["rename", "retag", "merge"]),
@@ -3326,7 +3337,8 @@ function createServer() {
         "Read-only search tool. Score and rank memories by text match (q), keyword overlap, " +
         "importance, and recency. Returns structured results with score/reason/content_snippet. " +
         "Defaults: excludes archived/resolved/digested. strict_q=true returns empty when q has no hits. " +
-        "touch=false (default) — does NOT update activation_count or last_active.",
+        "touch=false (default) — does NOT update activation_count or last_active." +
+        " English aliases: search memories, memory search, find memories, ranked memory search.",
       inputSchema: z.object({
         q: z.string().optional(),
         keywords: z.union([z.array(z.string()), z.string()]).optional(),
@@ -3631,7 +3643,8 @@ function createServer() {
         "Tier 2: bucket summaries for matched memories (include_buckets=true). " +
         "Tier 3: core/treasure permanent memories — only appended when Tier 1 has hits. " +
         "Returns context_text (Chinese-framed, ready-to-use), selected_memories, selected_buckets. " +
-        "touch=false by default (read-only). touch=true writes activation_count for final selected ids only.",
+        "touch=false by default (read-only). touch=true writes activation_count for final selected ids only." +
+        " English aliases: recall context, retrieve context, memory recall, relevant memories, context retrieval.",
       inputSchema: z.object({
         q: z.string().min(1),
         profile: z.enum(["shared", "rowan", "arion", "all"]).optional().default("shared"),
