@@ -2623,7 +2623,8 @@ function createServer() {
           items: recentDiaries.map((m) => {
             const snap = m.today_snapshot || m.title || String(m.content || "").slice(0, 40);
             const datePrefix = m.date ? String(m.date).slice(0, 10) + " · " : "";
-            return (datePrefix + snap.trim()).trim();
+            const base = (datePrefix + snap.trim()).trim();
+            return m.chord_tag ? `${base} · chord_tag: ${m.chord_tag}` : base;
           }),
         });
       }
@@ -2637,7 +2638,7 @@ function createServer() {
       const topDailys = allDailys.slice(0, 3);
       if (topDailys.length) {
         sections.push({
-          label: "最近的事",
+          label: "短期线索",
           items: topDailys.map((m) => (m.title || String(m.content || "").slice(0, 36)).trim()),
         });
       }
@@ -2672,7 +2673,7 @@ function createServer() {
         result: { total_items: totalItems, section_count: sections.length },
       });
 
-      return makeResult(result, `[记忆浮现 · ${generatedAt}]\n${briefingText}`);
+      return makeResult(result, `[SESSION BRIEFING · ${generatedAt}]\n${briefingText}`);
     }
   );
 
