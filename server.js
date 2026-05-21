@@ -1579,6 +1579,10 @@ function createServer() {
       title: "Memory Write",
       description:
         "Write one memory item into the Supabase public.memories table. " +
+        "Call policy — 只有信息有长期价值时才写：明确偏好、雷区、关系设定、重要事件、稳定的身份/规则、日记/珍宝/长期记忆。" +
+        "不要写：临时情绪波动、一次性的手机活动、普通寒暄、未确认的推测。" +
+        "Only write when the information has lasting value (explicit preferences, hard lines, relationship settings, significant events, stable identity/rules, diary/treasure/long-term memory); " +
+        "do not write transient emotional spikes, one-off phone activity, small talk, or unconfirmed speculation. " +
         "Field semantics — " +
         "content：日记/记录正文，按 author 视角写，谁写都可以；author 是小克时，小克自己的状态写在 content。" +
         "today_snapshot = 沅沅今天的状态切片，用于前端「今天的你」与 briefing。它不是事件流水账，也不是时间顺序摘要。" +
@@ -2151,6 +2155,10 @@ function createServer() {
         "Uses lightweight keyword/title/content similarity scoring (no embeddings). " +
         "If the best candidate scores >= threshold the new content is appended to that memory; " +
         "otherwise a new memory is created. " +
+        "Call policy — 只有信息有长期价值时才写：明确偏好、雷区、关系设定、重要事件、稳定的身份/规则、日记/珍宝/长期记忆。" +
+        "不要写：临时情绪波动、一次性的手机活动、普通寒暄、未确认的推测。" +
+        "Only write when the information has lasting value (explicit preferences, hard lines, relationship settings, significant events, stable identity/rules, diary/treasure/long-term memory); " +
+        "do not write transient emotional spikes, one-off phone activity, small talk, or unconfirmed speculation. " +
         "Field semantics — " +
         "content：日记/记录正文，按 author 视角写，谁写都可以；author 是小克时，小克自己的状态写在 content。" +
         "today_snapshot = 沅沅今天的状态切片，用于前端「今天的你」与 briefing。它不是事件流水账，也不是时间顺序摘要。" +
@@ -2569,8 +2577,9 @@ function createServer() {
         "diary = 每日主记录（叙事/情绪/生活片段），briefing 优先读取 diary.today_snapshot —— " +
         "today_snapshot 表示沅沅今日状态，不是 diary 作者（即使 author 是小克）自己的状态摘要；" +
         "daily = 短期事项/临时上下文/提醒，不再作为每日自动记录与 diary 重复。" +
-        "Intended to be injected once per session at the start of a conversation " +
-        "so the model is aware of recent context without manual querying." +
+        "Auto-injected by the session-start UserPromptSubmit hook so the model already has recent context. " +
+        "Call policy — 不要每轮主动调用 memory_briefing；只有当用户明确要求「总结近期状态 / 交接单 / 现在的上下文」时再调用。" +
+        "Do not call this tool every turn; only invoke when the user explicitly asks for a recap, handoff, or current-context summary." +
         " English aliases: session briefing, memory briefing, startup context, handoff summary, recent context.",
       inputSchema: z.object({}),
       outputSchema: z.object({
@@ -3664,7 +3673,18 @@ function createServer() {
         "Tier 2: bucket summaries for matched memories (include_buckets=true). " +
         "Tier 3: core/treasure permanent memories — only appended when Tier 1 has hits. " +
         "Returns context_text (Chinese-framed, ready-to-use), selected_memories, selected_buckets. " +
-        "touch=false by default (read-only). touch=true writes activation_count for final selected ids only." +
+        "touch=false by default (read-only). touch=true writes activation_count for final selected ids only. " +
+        "Call policy — 在以下情况调用：用户说「还记得吗 / 之前说过 / 接着上次 / 上次那个 / 刚才那条线 / 翻一下之前」、" +
+        "提到具体旧主题（某本书 / 某个人 / 某个项目 / 某个 bug / 某段关系设定）、当前问题明显需要跨窗口上下文，或用户明确要求查记忆。" +
+        "不要在以下情况调用：普通闲聊、一句简单情绪回应、早安晚安亲亲抱抱、用户正烦躁只需先接情绪、当前上下文已经足够回答。" +
+        "q 要写具体的主题词或短语，不要用「沅沅 / 用户 / 今天」这种泛词当 q。" +
+        "touch 默认 false；只有确实采用了召回内容并以此推进对话时才考虑 touch=true。" +
+        "召回内容只作为背景：不要生硬复述「我查到记忆里写着」，不要把 briefing/recall 原文倒给用户，只在相关处自然带入。" +
+        "English call policy — invoke when the user signals memory ('remember when…', 'last time we…', 'that thing earlier'), names a specific past topic (a book / person / project / bug / relationship setting), or the current turn clearly needs cross-window context. " +
+        "Skip for small talk, one-line emotional replies, greetings, when the user is venting and only needs to be heard, or when the current context already suffices. " +
+        "q must be a concrete word/phrase from the user's turn — never use generic terms like 沅沅 / user / today. " +
+        "Keep touch=false by default; only set touch=true after the recalled material is actually used to move the conversation forward. " +
+        "Treat recalled content as background — never quote it back verbatim or dump briefing/recall text to the user." +
         " English aliases: recall context, retrieve context, memory recall, relevant memories, context retrieval.",
       inputSchema: z.object({
         q: z.string().min(1),
