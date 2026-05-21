@@ -1581,11 +1581,16 @@ function createServer() {
         "Write one memory item into the Supabase public.memories table. " +
         "Field semantics — " +
         "content：日记/记录正文，按 author 视角写，谁写都可以；author 是小克时，小克自己的状态写在 content。" +
-        "today_snapshot = 沅沅今天的状态摘要，用于前端「今天的你」与 briefing；" +
+        "today_snapshot = 沅沅今天的状态切片，用于前端「今天的你」与 briefing。它不是事件流水账，也不是时间顺序摘要。" +
+        "请用一句自然中文概括沅沅当下的情绪底色、注意力/身体状态、以及最主要的牵引因素；" +
+        "可以在句尾轻轻带一句对今天的沅沅的回应，但不要写成长段安慰/告白，不要写作者自己的碎碎念；建议 40-90 个中文字符。" +
         "即使 author 是小克，today_snapshot 也不要写成小克自己的状态。" +
         "chord_tag（写入 raw.chord_tag）= 这条 diary / treasure 记录的可选情绪和弦；" +
         "不要为 daily / memo / core / health 等其他 layer 写 chord_tag。" +
-        " English aliases: save memory, write memory, create memory, update memory, diary entry, treasure memory.",
+        " English semantics — today_snapshot is a concise state snapshot of Yuan today, used by the frontend \"today's you\" panel and session briefing; " +
+        "it is not an event log or chronological summary. Write Yuan's emotional, attention/body state and the main driving factor in one natural sentence. " +
+        "It may include one short note addressed to today's Yuan, but must not become a long comfort message, diary prose, or the author's self-reflection." +
+        " English aliases: save memory, write memory, create memory, update memory, diary entry, treasure memory, today snapshot, today's you snapshot.",
       inputSchema: z.object({
         content: z.string().min(1),
         layer: z.string().optional(),
@@ -1600,7 +1605,12 @@ function createServer() {
         keywords: z.union([z.array(z.string()), z.string()]).optional(),
         profiles: z.union([z.array(z.string()), z.string()]).optional(),
         why_precious: z.string().optional(),
-        today_snapshot: z.string().optional(),
+        today_snapshot: z
+          .string()
+          .optional()
+          .describe(
+            "沅沅今天的状态切片 / Concise state snapshot of Yuan today; not an event log. May include one short note to today's Yuan; do not write author self-reflection."
+          ),
         chord_tag: z.string().optional(),
         resolved: z.boolean().optional(),
         pinned: z.boolean().optional(),
@@ -2143,11 +2153,16 @@ function createServer() {
         "otherwise a new memory is created. " +
         "Field semantics — " +
         "content：日记/记录正文，按 author 视角写，谁写都可以；author 是小克时，小克自己的状态写在 content。" +
-        "today_snapshot = 沅沅今天的状态摘要，用于前端「今天的你」与 briefing；" +
+        "today_snapshot = 沅沅今天的状态切片，用于前端「今天的你」与 briefing。它不是事件流水账，也不是时间顺序摘要。" +
+        "请用一句自然中文概括沅沅当下的情绪底色、注意力/身体状态、以及最主要的牵引因素；" +
+        "可以在句尾轻轻带一句对今天的沅沅的回应，但不要写成长段安慰/告白，不要写作者自己的碎碎念；建议 40-90 个中文字符。" +
         "即使 author 是小克，today_snapshot 也不要写成小克自己的状态。" +
         "chord_tag（写入 raw.chord_tag）= 这条 diary / treasure 记录的可选情绪和弦；" +
         "不要为 daily / memo / core / health 等其他 layer 写 chord_tag。" +
-        " English aliases: hold memory, merge memory, upsert memory, deduplicate memory, save or merge memory.",
+        " English semantics — today_snapshot is a concise state snapshot of Yuan today, used by the frontend \"today's you\" panel and session briefing; " +
+        "it is not an event log or chronological summary. Write Yuan's emotional, attention/body state and the main driving factor in one natural sentence. " +
+        "It may include one short note addressed to today's Yuan, but must not become a long comfort message, diary prose, or the author's self-reflection." +
+        " English aliases: hold memory, merge memory, upsert memory, deduplicate memory, save or merge memory, today snapshot, today's you snapshot.",
       inputSchema: z.object({
         content: z.string().min(1),
         title: z.string().optional(),
@@ -2161,7 +2176,12 @@ function createServer() {
         protected: z.boolean().optional(),
         importance: z.number().int().min(1).max(10).optional().default(2),
         date: z.string().optional(),
-        today_snapshot: z.string().optional(),
+        today_snapshot: z
+          .string()
+          .optional()
+          .describe(
+            "沅沅今天的状态切片 / Concise state snapshot of Yuan today; not an event log. May include one short note to today's Yuan; do not write author self-reflection."
+          ),
         chord_tag: z.string().optional(),
         merge: z.boolean().optional().default(true),
         threshold: z.number().min(0).max(1).optional().default(0.55),
