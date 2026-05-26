@@ -730,7 +730,13 @@ const memoryRecordSchema = z
     content: z.string(),
     why_precious: z.string().optional().default(""),
     today_snapshot: z.string().optional().default(""),
-    chord_tag: z.string().optional().default(""),
+    chord_tag: z
+      .string()
+      .optional()
+      .default("")
+      .describe(
+        "可选的音乐化情绪和弦/和弦进行标记（和弦名/进行/调性/bpm/质感），不是心情描述；仅 diary / treasure。/ Compact music-like chord/progression tag, not a prose mood description."
+      ),
     importance: z.number(),
     activation_count: z.number().optional(),
     last_active: z.string().optional(),
@@ -1589,8 +1595,13 @@ function createServer() {
         "请用一句自然中文概括沅沅当下的情绪底色、注意力/身体状态、以及最主要的牵引因素；" +
         "可以在句尾轻轻带一句对今天的沅沅的回应，但不要写成长段安慰/告白，不要写作者自己的碎碎念；建议 40-90 个中文字符。" +
         "即使 author 是小克，today_snapshot 也不要写成小克自己的状态。" +
-        "chord_tag（写入 raw.chord_tag）= 这条 diary / treasure 记录的可选情绪和弦；" +
+        "chord_tag（写入 raw.chord_tag）= 可选的「音乐化情绪和弦/和弦进行」标记，只用于 diary / treasure；" +
         "不要为 daily / memo / core / health 等其他 layer 写 chord_tag。" +
+        "它不是心情描述：不要写自然语言状态句（坏例子：「今天很累但有一点开心」「温柔、疲惫、想被抱」「明亮但混乱」「焦虑中带着期待」「委屈但被安慰到了」）。" +
+        "应写成像简短乐理标记的东西——和弦名、和弦进行、调性、速度(bpm)、质感等。" +
+        "好例子：「Fmaj9 → C/E → Am add9 → G6sus4 · 72bpm」「Dm9 → G13 → Cmaj7 · rainy / soft」「A minor drone · slow 60bpm」「E♭maj7 → B♭/D → Cm9」「Cmaj7 · warm, suspended」。" +
+        "如果给不出像样的和弦/音乐标记，就留空，不要硬凑。" +
+        " English — chord_tag must look like a compact music/chord/progression notation: use chord symbols, progression arrows, key/mode, bpm, or short texture words; do not write prose mood/state descriptions; if no useful music-like tag is available, omit chord_tag." +
         " English semantics — today_snapshot is a concise state snapshot of Yuan today, used by the frontend \"today's you\" panel and session briefing; " +
         "it is not an event log or chronological summary. Write Yuan's emotional, attention/body state and the main driving factor in one natural sentence. " +
         "It may include one short note addressed to today's Yuan, but must not become a long comfort message, diary prose, or the author's self-reflection." +
@@ -1615,7 +1626,12 @@ function createServer() {
           .describe(
             "沅沅今天的状态切片 / Concise state snapshot of Yuan today; not an event log. May include one short note to today's Yuan; do not write author self-reflection."
           ),
-        chord_tag: z.string().optional(),
+        chord_tag: z
+          .string()
+          .optional()
+          .describe(
+            "可选的音乐化情绪和弦/和弦进行标记，写入 raw.chord_tag，仅用于 diary / treasure。它不是心情描述，不要写自然语言状态句（坏例子：「温柔、疲惫、想被抱」「明亮但混乱」）。应写成简短乐理标记：和弦名/和弦进行/调性/bpm/质感，例如「Fmaj9 → C/E → Am add9 · 72bpm」「Dm9 → G13 → Cmaj7 · rainy / soft」「A minor drone · slow 60bpm」。给不出像样的和弦标记就留空。/ chord_tag must look like compact music/chord/progression notation (chord symbols, progression arrows, key/mode, bpm, short texture words), not a prose mood/state description; omit if no useful music-like tag is available."
+          ),
         resolved: z.boolean().optional(),
         pinned: z.boolean().optional(),
         protected: z.boolean().optional(),
@@ -2165,8 +2181,13 @@ function createServer() {
         "请用一句自然中文概括沅沅当下的情绪底色、注意力/身体状态、以及最主要的牵引因素；" +
         "可以在句尾轻轻带一句对今天的沅沅的回应，但不要写成长段安慰/告白，不要写作者自己的碎碎念；建议 40-90 个中文字符。" +
         "即使 author 是小克，today_snapshot 也不要写成小克自己的状态。" +
-        "chord_tag（写入 raw.chord_tag）= 这条 diary / treasure 记录的可选情绪和弦；" +
+        "chord_tag（写入 raw.chord_tag）= 可选的「音乐化情绪和弦/和弦进行」标记，只用于 diary / treasure；" +
         "不要为 daily / memo / core / health 等其他 layer 写 chord_tag。" +
+        "它不是心情描述：不要写自然语言状态句（坏例子：「今天很累但有一点开心」「温柔、疲惫、想被抱」「明亮但混乱」「焦虑中带着期待」「委屈但被安慰到了」）。" +
+        "应写成像简短乐理标记的东西——和弦名、和弦进行、调性、速度(bpm)、质感等。" +
+        "好例子：「Fmaj9 → C/E → Am add9 → G6sus4 · 72bpm」「Dm9 → G13 → Cmaj7 · rainy / soft」「A minor drone · slow 60bpm」「E♭maj7 → B♭/D → Cm9」「Cmaj7 · warm, suspended」。" +
+        "如果给不出像样的和弦/音乐标记，就留空，不要硬凑。" +
+        " English — chord_tag must look like a compact music/chord/progression notation: use chord symbols, progression arrows, key/mode, bpm, or short texture words; do not write prose mood/state descriptions; if no useful music-like tag is available, omit chord_tag." +
         " English semantics — today_snapshot is a concise state snapshot of Yuan today, used by the frontend \"today's you\" panel and session briefing; " +
         "it is not an event log or chronological summary. Write Yuan's emotional, attention/body state and the main driving factor in one natural sentence. " +
         "It may include one short note addressed to today's Yuan, but must not become a long comfort message, diary prose, or the author's self-reflection." +
@@ -2190,7 +2211,12 @@ function createServer() {
           .describe(
             "沅沅今天的状态切片 / Concise state snapshot of Yuan today; not an event log. May include one short note to today's Yuan; do not write author self-reflection."
           ),
-        chord_tag: z.string().optional(),
+        chord_tag: z
+          .string()
+          .optional()
+          .describe(
+            "可选的音乐化情绪和弦/和弦进行标记，写入 raw.chord_tag，仅用于 diary / treasure。它不是心情描述，不要写自然语言状态句（坏例子：「温柔、疲惫、想被抱」「明亮但混乱」）。应写成简短乐理标记：和弦名/和弦进行/调性/bpm/质感，例如「Fmaj9 → C/E → Am add9 · 72bpm」「Dm9 → G13 → Cmaj7 · rainy / soft」「A minor drone · slow 60bpm」。给不出像样的和弦标记就留空。/ chord_tag must look like compact music/chord/progression notation (chord symbols, progression arrows, key/mode, bpm, short texture words), not a prose mood/state description; omit if no useful music-like tag is available."
+          ),
         merge: z.boolean().optional().default(true),
         threshold: z.number().min(0).max(1).optional().default(0.55),
         limit: z.number().int().min(1).max(100).optional().default(20),
