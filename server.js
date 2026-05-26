@@ -1754,7 +1754,7 @@ function createServer() {
         mode,
       };
       if (row.layer === "diary" && !row.raw?.chord_tag) {
-        result.hint = "chord_tag（可选）= 这条 diary 记录的情绪和弦；今天的情绪是什么调？可不填。";
+        result.hint = "chord_tag（可选）= 音乐化和弦/进行标记，如 Fmaj9 → C/E → Am add9 · 72bpm；不是心情描述，不会写就留空。";
       }
 
       log("info", "tool", {
