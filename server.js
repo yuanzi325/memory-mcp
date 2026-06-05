@@ -350,6 +350,12 @@ const RAW_COMPAT_FIELDS = [
   "arousal",
   "activation_count",
   "last_active",
+  "anchor",
+  "confidence",
+  "intimacy",
+  "safety",
+  "texture",
+  "bucket",
 ];
 
 function buildMemoryRow(input = {}, { isUpdate = false } = {}) {
@@ -397,6 +403,24 @@ function buildMemoryRow(input = {}, { isUpdate = false } = {}) {
   }
   if (raw.arousal !== undefined) {
     raw.arousal = clampNumber(raw.arousal, 0, 1, 0.3);
+  }
+  if (raw.anchor !== undefined) {
+    raw.anchor = Boolean(raw.anchor);
+  }
+  if (raw.confidence !== undefined) {
+    raw.confidence = clampNumber(raw.confidence, 0, 1, 0.7);
+  }
+  if (raw.intimacy !== undefined) {
+    raw.intimacy = clampNumber(raw.intimacy, 0, 1, 0.5);
+  }
+  if (raw.safety !== undefined) {
+    raw.safety = clampNumber(raw.safety, 0, 1, 0.5);
+  }
+  if (raw.texture !== undefined) {
+    raw.texture = safeString(raw.texture, STR_LIMITS.summary);
+  }
+  if (raw.bucket !== undefined) {
+    raw.bucket = safeString(raw.bucket, STR_LIMITS.short);
   }
 
   const row = {
@@ -474,6 +498,12 @@ function denormalizeMemoryRow(row) {
   const arousal = raw.arousal ?? row.arousal;
   if (typeof valence === "number") denormalized.valence = valence;
   if (typeof arousal === "number") denormalized.arousal = arousal;
+  denormalized.anchor = Boolean(raw.anchor ?? false);
+  if (typeof raw.confidence === "number") denormalized.confidence = raw.confidence;
+  if (typeof raw.intimacy === "number") denormalized.intimacy = raw.intimacy;
+  if (typeof raw.safety === "number") denormalized.safety = raw.safety;
+  denormalized.texture = typeof raw.texture === "string" ? raw.texture : "";
+  denormalized.bucket = typeof raw.bucket === "string" ? raw.bucket : "";
   return denormalized;
 }
 
@@ -748,6 +778,12 @@ const memoryRecordSchema = z
     _archived: z.boolean().optional(),
     valence: z.number().optional(),
     arousal: z.number().optional(),
+    anchor: z.boolean().optional(),
+    confidence: z.number().optional(),
+    intimacy: z.number().optional(),
+    safety: z.number().optional(),
+    texture: z.string().optional().default(""),
+    bucket: z.string().optional().default(""),
     raw: z.record(z.any()).optional(),
   })
   .passthrough();
@@ -1640,6 +1676,12 @@ function createServer() {
         arousal: z.number().optional(),
         activation_count: z.number().optional(),
         last_active: z.string().optional(),
+        anchor: z.boolean().optional(),
+        confidence: z.number().optional(),
+        intimacy: z.number().optional(),
+        safety: z.number().optional(),
+        texture: z.string().optional(),
+        bucket: z.string().optional(),
         raw: z.record(z.any()).optional(),
       }),
       outputSchema: z.object({
@@ -2217,6 +2259,12 @@ function createServer() {
           .describe(
             "可选的音乐化情绪和弦/和弦进行标记，写入 raw.chord_tag，仅用于 diary / treasure。它不是心情描述，不要写自然语言状态句（坏例子：「温柔、疲惫、想被抱」「明亮但混乱」）。应写成简短乐理标记：和弦名/和弦进行/调性/bpm/质感，例如「Fmaj9 → C/E → Am add9 · 72bpm」「Dm9 → G13 → Cmaj7 · rainy / soft」「A minor drone · slow 60bpm」。给不出像样的和弦标记就留空。/ chord_tag must look like compact music/chord/progression notation (chord symbols, progression arrows, key/mode, bpm, short texture words), not a prose mood/state description; omit if no useful music-like tag is available."
           ),
+        anchor: z.boolean().optional(),
+        confidence: z.number().optional(),
+        intimacy: z.number().optional(),
+        safety: z.number().optional(),
+        texture: z.string().optional(),
+        bucket: z.string().optional(),
         merge: z.boolean().optional().default(true),
         threshold: z.number().min(0).max(1).optional().default(0.55),
         limit: z.number().int().min(1).max(100).optional().default(20),
