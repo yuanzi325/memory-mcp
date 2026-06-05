@@ -1387,7 +1387,10 @@ async function buildRecallContext({
   if (hasQ) memories = memories.filter((m) => memoryTextMatch(m, ql));
 
   const t1Scored = memories.map((m) => {
-    const { score, reason } = scoreSearchResult(m, ql, []);
+    const { score, reason: rawReason } = scoreSearchResult(m, ql, []);
+    const reason = hasQ
+      ? `query_match${rawReason ? ":" + rawReason : ""}`
+      : rawReason || "recency";
     return { m, score, reason, tier: 1 };
   });
   t1Scored.sort((a, b) => {
@@ -1408,6 +1411,9 @@ async function buildRecallContext({
       touch_applied: false,
       touched_ids: [],
       touched_count: 0,
+      touch_skipped_ids: [],
+      touch_skipped_count: 0,
+      touch_skipped_reasons: {},
     };
   }
 
@@ -1433,7 +1439,7 @@ async function buildRecallContext({
   const t3Candidates = t3Mems.slice(0, MAX_TIER3).map((m) => ({
     m,
     score: Number(m.importance) || 0,
-    reason: `layer=${m.layer} importance=${m.importance}`,
+    reason: m.layer === "treasure" ? "treasure_background" : "core_background",
     tier: 3,
   }));
 
@@ -1553,13 +1559,37 @@ async function buildRecallContext({
     digested: Boolean(m.digested),
   }));
 
-  // ─── Touch ───────────────────────────────────────────────────────────────
-  const touchIds = touch
-    ? [...new Set(selectedMemories.map((item) => item.id).filter(isValidUuid))]
-    : [];
-  if (touch && touchIds.length) {
-    log("info", "tool", { tool: "recall_context_touch", touch_ids: touchIds, touch_count: touchIds.length });
-    await Promise.allSettled(touchIds.map((id) => touchMemoryRow(id)));
+  // ─── Touch (with 1-hour cooldown) ────────────────────────────────────────
+  const ONE_HOUR_MS = 60 * 60 * 1000;
+  // id → memory object for cooldown lookup
+  const selectedMemMap = new Map([...t1Items, ...t3Items].map(({ m }) => [m.id, m]));
+
+  const touchSkippedIds = [];
+  const touchSkippedReasons = {};
+  const actualTouchIds = [];
+
+  if (touch) {
+    const candidateIds = [...new Set(selectedMemories.map((item) => item.id).filter(isValidUuid))];
+    for (const id of candidateIds) {
+      const mem = selectedMemMap.get(id);
+      const lastActive = mem ? parseDateLike(mem.last_active) : null;
+      if (lastActive && (Date.now() - lastActive.getTime()) < ONE_HOUR_MS) {
+        touchSkippedIds.push(id);
+        touchSkippedReasons[id] = "cooldown:last_active_within_1h";
+      } else {
+        actualTouchIds.push(id);
+      }
+    }
+  }
+
+  if (actualTouchIds.length) {
+    log("info", "tool", {
+      tool: "recall_context_touch",
+      touch_ids: actualTouchIds,
+      touch_count: actualTouchIds.length,
+      skipped_count: touchSkippedIds.length,
+    });
+    await Promise.allSettled(actualTouchIds.map((id) => touchMemoryRow(id)));
   }
 
   return {
@@ -1569,9 +1599,12 @@ async function buildRecallContext({
     omitted_count: omittedCount,
     omitted_reason: omittedReason,
     generated_at: generatedAt,
-    touch_applied: touch && touchIds.length > 0,
-    touched_ids: touchIds,
-    touched_count: touchIds.length,
+    touch_applied: actualTouchIds.length > 0,
+    touched_ids: actualTouchIds,
+    touched_count: actualTouchIds.length,
+    touch_skipped_ids: touchSkippedIds,
+    touch_skipped_count: touchSkippedIds.length,
+    touch_skipped_reasons: touchSkippedReasons,
   };
 }
 
@@ -3821,6 +3854,9 @@ function createServer() {
         touch_applied: z.boolean(),
         touched_ids: z.array(z.string()),
         touched_count: z.number(),
+        touch_skipped_ids: z.array(z.string()),
+        touch_skipped_count: z.number(),
+        touch_skipped_reasons: z.record(z.string()),
       }),
     },
     async ({
