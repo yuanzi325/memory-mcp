@@ -2292,11 +2292,17 @@ function createServer() {
       date,
       today_snapshot,
       chord_tag,
+      anchor,
+      confidence,
+      intimacy,
+      safety,
+      texture,
+      bucket,
       merge = true,
       threshold = 0.55,
       limit = 20,
     }) => {
-      const inputRow = buildMemoryRow({ content, title, layer, sub_layer, author, mood, keywords, profiles, importance, date, today_snapshot });
+      const inputRow = buildMemoryRow({ content, title, layer, sub_layer, author, mood, keywords, profiles, importance, date, today_snapshot, anchor, confidence, intimacy, safety, texture, bucket });
 
       // Apply pinned/protected to inputRow (only-raise; pinned forces protected)
       if (pinned) { inputRow.raw.pinned = true; inputRow.raw.protected = true; }
@@ -2422,6 +2428,13 @@ function createServer() {
         if (chord_tag.trim()) newRaw.chord_tag = chord_tag;
         else delete newRaw.chord_tag;
       }
+      // New compat fields: overlay when explicitly passed in, otherwise existingRaw value is already in newRaw via spread
+      if (anchor !== undefined) newRaw.anchor = Boolean(anchor);
+      if (confidence !== undefined) newRaw.confidence = confidence;
+      if (intimacy !== undefined) newRaw.intimacy = intimacy;
+      if (safety !== undefined) newRaw.safety = safety;
+      if (texture !== undefined) newRaw.texture = texture;
+      if (bucket !== undefined) newRaw.bucket = bucket;
 
       const mergeInput = { ...existing };
       // Strip top-level compat fields before buildMemoryRow to prevent override
