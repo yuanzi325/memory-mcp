@@ -6,6 +6,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import * as z from "zod";
 import { evaluateSentinel } from "./sentinel.js";
 import { resolveRecallPlan, layerAllowed } from "./recallPlan.js";
+import { planSmartRecall } from "./smartRecall.js";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -1632,6 +1633,58 @@ async function buildRecallContext({
     touch_skipped_reasons: touchSkippedReasons,
   };
 }
+
+// recall_context 的输出结构（smart_recall_context 复用为 recall 字段）。
+const recallContextOutputSchema = z.object({
+  context_text: z.string(),
+  selected_memories: z.array(
+    z.object({
+      id: z.string(),
+      title: z.string(),
+      layer: z.string(),
+      sub_layer: z.string(),
+      score: z.number(),
+      reason: z.string(),
+      content_snippet: z.string(),
+      bucket_id: z.string(),
+      importance: z.number(),
+      tier: z.number(),
+      recall_tier: z.string(),
+      pinned: z.boolean(),
+      protected: z.boolean(),
+      resolved: z.boolean(),
+      digested: z.boolean(),
+    })
+  ),
+  selected_buckets: z.array(
+    z.object({
+      bucket_id: z.string(),
+      name: z.string(),
+      bucket_type: z.string(),
+      memory_count: z.number(),
+      summary_snippet: z.string(),
+    })
+  ),
+  omitted_count: z.number(),
+  omitted_reason: z.array(z.string()),
+  generated_at: z.string(),
+  touch_applied: z.boolean(),
+  touched_ids: z.array(z.string()),
+  touched_count: z.number(),
+  touch_skipped_ids: z.array(z.string()),
+  touch_skipped_count: z.number(),
+  touch_skipped_reasons: z.record(z.string()),
+});
+
+// memory_sentinel 的输出结构（smart_recall_context 复用为 sentinel 字段）。
+const sentinelOutputSchema = z.object({
+  need_recall: z.boolean(),
+  depth: z.enum(["none", "shallow", "normal", "deep"]),
+  q: z.string(),
+  layers: z.array(z.string()),
+  reason: z.string(),
+  touch_recommended: z.boolean(),
+});
 
 function createServer() {
   const server = new McpServer({
@@ -3998,6 +4051,129 @@ function createServer() {
       });
 
       return makeResult(result, result.context_text);
+    }
+  );
+
+  server.registerTool(
+    "smart_recall_context",
+    {
+      title: "Smart Recall Context",
+      description:
+        "一体化召回：先用 memory_sentinel 判断这一轮要不要召回、查什么、查多深，" +
+        "若需要再自动带着 sentinel 的 q/depth/layers/touch 去跑 recall_context。" +
+        "调用方只需传当前 message，不必手动两步走，也不会漏传 depth/layers。" +
+        "行为 — need_recall=false 且 force!==true 时：不读数据库、不召回、不 touch，直接返回 recall=null、context_text=\"\"、skipped_reason=sentinel.reason。" +
+        "need_recall=true 或 force=true 时：q=sentinel.q||message，depth=none→normal，layers=sentinel.layers，" +
+        "touch 显式参数优先、否则跟随 sentinel.touch_recommended，其余 include/budget 参数透传。" +
+        "force=true 用于用户明确说「查一下记忆 / 翻一下之前」，即使 sentinel 保守判 false 也强制召回。" +
+        "本工具不写记忆；touch 仍只经 recall_context 原有 cooldown 执行。" +
+        "返回 { need_recall, sentinel, recall, context_text, skipped_reason }，召回内容只作背景，不要原文倒给用户。" +
+        " English — one-shot recall: run memory_sentinel first, then auto-run recall_context with its q/depth/layers/touch only when needed. " +
+        "force=true recalls even if the sentinel is conservative. No memory writes; touch still obeys recall_context cooldown. " +
+        "English aliases: smart recall, auto recall, gated recall, one-shot recall, recall if needed.",
+      inputSchema: z.object({
+        message: z.string(),
+        profile: z.enum(["shared", "rowan", "arion", "all"]).optional().default("shared"),
+        recent_context: z.string().optional(),
+        force: z.boolean().optional().default(false),
+        touch: z.boolean().optional(),
+        budget_chars: z.number().int().min(500).max(20000).optional(),
+        max_items: z.number().int().min(1).max(50).optional(),
+        include_resolved: z.boolean().optional().default(false),
+        include_digested: z.boolean().optional().default(false),
+        include_archived: z.boolean().optional().default(false),
+        include_buckets: z.boolean().optional().default(true),
+      }),
+      outputSchema: z.object({
+        need_recall: z.boolean(),
+        sentinel: sentinelOutputSchema,
+        recall: recallContextOutputSchema.nullable(),
+        context_text: z.string(),
+        skipped_reason: z.string(),
+      }),
+    },
+    async ({
+      message,
+      profile = "shared",
+      recent_context,
+      force = false,
+      touch,
+      budget_chars,
+      max_items,
+      include_resolved = false,
+      include_digested = false,
+      include_archived = false,
+      include_buckets = true,
+    }) => {
+      // 1) 哨兵判断（纯逻辑，无副作用）。
+      const sentinel = evaluateSentinel({ message, profile, recent_context });
+
+      // 2) 编排：决定要不要召回、用什么参数（纯逻辑）。
+      const decision = planSmartRecall({ message, sentinel, force, touch });
+
+      // 3) 不召回：短路，不读数据库、不 touch。
+      if (!decision.should_recall) {
+        const out = {
+          need_recall: false,
+          sentinel,
+          recall: null,
+          context_text: "",
+          skipped_reason: decision.skipped_reason,
+        };
+        log("info", "tool", {
+          tool: "smart_recall_context",
+          args: { message_chars: typeof message === "string" ? message.length : 0, profile, force },
+          result: { need_recall: false, recalled: false, skipped_reason: decision.skipped_reason },
+        });
+        return makeResult(out, `smart_recall_context：跳过召回（${decision.skipped_reason}）`);
+      }
+
+      // 4) 召回：带上 sentinel 计划 + 透传项。
+      const { q, depth, layers, touch: effTouch } = decision.recall_args;
+      const recall = await buildRecallContext({
+        q,
+        profile,
+        depth,
+        layers,
+        budget_chars,
+        max_items,
+        include_resolved,
+        include_digested,
+        include_archived,
+        touch: effTouch,
+        include_buckets,
+      });
+
+      const out = {
+        need_recall: true,
+        sentinel,
+        recall,
+        context_text: recall.context_text,
+        skipped_reason: "",
+      };
+
+      log("info", "tool", {
+        tool: "smart_recall_context",
+        args: {
+          message_chars: typeof message === "string" ? message.length : 0,
+          profile,
+          force,
+          q,
+          depth,
+          layers: layers ?? null,
+          touch: effTouch,
+        },
+        result: {
+          need_recall: true,
+          recalled: true,
+          selected_count: recall.selected_memories.length,
+          bucket_count: recall.selected_buckets.length,
+          touch_applied: recall.touch_applied,
+          context_chars: recall.context_text.length,
+        },
+      });
+
+      return makeResult(out, recall.context_text);
     }
   );
 
