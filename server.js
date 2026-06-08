@@ -15,6 +15,7 @@ import {
   removeComment,
 } from "./ringComments.js";
 import { extractCandidates } from "./importCandidates.js";
+import { planCommit, planCandidate } from "./commitCandidates.js";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -1694,6 +1695,255 @@ const sentinelOutputSchema = z.object({
   touch_recommended: z.boolean(),
 });
 
+// 写入一条新记忆，或合并进相似的已有记忆（memory_hold 的核心逻辑，供工具与导入 commit 复用）。
+// 返回 { mode: "created"|"merged", item, matched_id?, similarity, considered_count }。
+async function holdMemory({
+  content,
+  title,
+  layer = "daily",
+  sub_layer,
+  author,
+  mood,
+  keywords,
+  profiles,
+  pinned,
+  protected: protectedFlag,
+  importance = 2,
+  date,
+  today_snapshot,
+  chord_tag,
+  anchor,
+  confidence,
+  intimacy,
+  safety,
+  texture,
+  bucket,
+  merge = true,
+  threshold = 0.55,
+  limit = 20,
+  raw: importRaw,
+} = {}) {
+  const inputRow = buildMemoryRow({ content, title, layer, sub_layer, author, mood, keywords, profiles, importance, date, today_snapshot, anchor, confidence, intimacy, safety, texture, bucket });
+
+  // Apply pinned/protected to inputRow (only-raise; pinned forces protected)
+  if (pinned) { inputRow.raw.pinned = true; inputRow.raw.protected = true; }
+  else if (protectedFlag) { inputRow.raw.protected = true; }
+  // chord_tag: only persist for diary/treasure; ignored on other layers
+  if (chord_tag !== undefined && (layer === "diary" || layer === "treasure")) {
+    if (chord_tag.trim()) inputRow.raw.chord_tag = chord_tag;
+    else delete inputRow.raw.chord_tag;
+  }
+  // Overlay caller-supplied raw (e.g. import provenance) without clobbering core fields.
+  if (importRaw && typeof importRaw === "object" && !Array.isArray(importRaw)) {
+    inputRow.raw = { ...inputRow.raw, ...importRaw };
+  }
+
+  if (!merge) {
+    if (!inputRow.bucket_id) {
+      try {
+        const bucket = await findBestBucketForMemory(inputRow) || buildBucketForMemory(inputRow);
+        applyBucketFields(inputRow, bucket);
+      } catch (_) {}
+    }
+    syncRawToColumns(inputRow);
+    const saved = await insertMemoryRow(inputRow);
+    const item = denormalizeMemoryRow(saved);
+    log("info", "tool", {
+      tool: "memory_hold",
+      mode: "created",
+      args: { layer, title, keyword_count: inputRow.keywords.length },
+      result: { item_id: item?.id },
+    });
+    return { mode: "created", item, similarity: 0, considered_count: 0 };
+  }
+
+  // Build candidate pool
+  const [kwRows, titleRows, recentRows] = await Promise.all([
+    inputRow.keywords.length
+      ? queryMemoryRows({ keywords: inputRow.keywords, layer, sub_layer, limit: limit * 5 })
+      : Promise.resolve([]),
+    title
+      ? queryMemoryRows({ q: title, layer, sub_layer, limit: limit * 3 })
+      : Promise.resolve([]),
+    readMemoryRows({ layer, sub_layer, limit: limit * 3 }),
+  ]);
+
+  const seen = new Set();
+  const candidates = [];
+  for (const r of [...kwRows, ...titleRows, ...recentRows]) {
+    if (r?.id && !seen.has(r.id)) {
+      seen.add(r.id);
+      const den = denormalizeMemoryRow(r);
+      if (den) candidates.push(den);
+    }
+  }
+
+  // Filter: no archived, no resolved
+  const eligible = candidates.filter((m) => !m._archived && !m.resolved);
+
+  // Score each candidate
+  const scored = eligible
+    .map((m) => ({ m, score: calcHoldSimilarity(inputRow, m) }))
+    .sort((a, b) => b.score - a.score);
+
+  const best = scored[0];
+
+  if (!best || best.score < threshold) {
+    if (!inputRow.bucket_id) {
+      try {
+        const bucket = await findBestBucketForMemory(inputRow) || buildBucketForMemory(inputRow);
+        applyBucketFields(inputRow, bucket);
+      } catch (_) {}
+    }
+    syncRawToColumns(inputRow);
+    const saved = await insertMemoryRow(inputRow);
+    const item = denormalizeMemoryRow(saved);
+    log("info", "tool", {
+      tool: "memory_hold",
+      mode: "created",
+      args: { layer, title, threshold },
+      result: { item_id: item?.id, best_score: best?.score ?? 0, considered_count: eligible.length },
+    });
+    return { mode: "created", item, similarity: best?.score ?? 0, considered_count: eligible.length };
+  }
+
+  // Merge into best match
+  const existing = best.m;
+  const existingRaw = ensureObject(existing.raw, {});
+
+  const appendDate = (date || new Date().toISOString()).slice(0, 10);
+  const mergedContent =
+    String(existing.content || "") +
+    `\n\n---\n补充于 ${appendDate}：\n${inputRow.content}`;
+
+  const mergedKeywords = [
+    ...new Set([...ensureArray(existing.keywords), ...inputRow.keywords]),
+  ];
+  const mergedProfiles = [
+    ...new Set([...effectiveProfiles(existing.profiles), ...inputRow.profiles]),
+  ];
+  const mergedImportance = Math.max(
+    Number(existing.importance) || 0,
+    inputRow.importance
+  );
+
+  const now = new Date().toISOString();
+  const newRaw = {
+    ...existingRaw,
+    activation_count:
+      (Number(existingRaw.activation_count ?? existing.activation_count) || 0) + 1,
+    last_active: now,
+  };
+  // Preserve existing pinned/protected — never lower them on merge
+  if (existing.pinned) newRaw.pinned = true;
+  if (existing.protected) newRaw.protected = true;
+  // Apply incoming pinned/protected — only raise, never lower
+  if (pinned) { newRaw.pinned = true; newRaw.protected = true; }
+  else if (protectedFlag) { newRaw.protected = true; }
+  // today_snapshot: new value overrides existing when provided
+  if (today_snapshot !== undefined) newRaw.today_snapshot = today_snapshot;
+  // chord_tag: only overlay for diary/treasure; trim-empty deletes
+  if (chord_tag !== undefined && (layer === "diary" || layer === "treasure")) {
+    if (chord_tag.trim()) newRaw.chord_tag = chord_tag;
+    else delete newRaw.chord_tag;
+  }
+  // New compat fields: overlay when explicitly passed in, otherwise existingRaw value is already in newRaw via spread
+  if (anchor !== undefined) newRaw.anchor = Boolean(anchor);
+  if (confidence !== undefined) newRaw.confidence = confidence;
+  if (intimacy !== undefined) newRaw.intimacy = intimacy;
+  if (safety !== undefined) newRaw.safety = safety;
+  if (texture !== undefined) newRaw.texture = texture;
+  if (bucket !== undefined) newRaw.bucket = bucket;
+  // Overlay caller-supplied raw (e.g. import provenance) on merge too.
+  if (importRaw && typeof importRaw === "object" && !Array.isArray(importRaw)) {
+    Object.assign(newRaw, importRaw);
+  }
+
+  const mergeInput = { ...existing };
+  // Strip top-level compat fields before buildMemoryRow to prevent override
+  for (const field of RAW_COMPAT_FIELDS) delete mergeInput[field];
+  delete mergeInput.digested;
+
+  mergeInput.content = mergedContent;
+  mergeInput.keywords = mergedKeywords;
+  mergeInput.profiles = mergedProfiles;
+  mergeInput.importance = mergedImportance;
+  if (mood) mergeInput.mood = mood;
+  if (author) mergeInput.author = author;
+  mergeInput.raw = newRaw;
+  mergeInput.id = existing.id;
+
+  const row = buildMemoryRow(mergeInput, { isUpdate: true });
+  // Force-preserve values that buildMemoryRow might not carry
+  if (newRaw.pinned) row.raw.pinned = true;
+  if (newRaw.protected) row.raw.protected = true;
+  if (existingRaw.digested !== undefined) row.raw.digested = existingRaw.digested;
+  row.raw.activation_count = newRaw.activation_count;
+  row.raw.last_active = now;
+
+  // Bucket: prefer existing bucket; only auto-assign if existing has none
+  if (existing.bucket_id) {
+    row.bucket_id = existing.bucket_id;
+    row.bucket_type = existing.bucket_type || inferBucketType(existing.layer || "daily");
+    row.name = existing.name || "";
+    row.domain = ensureArray(existing.domain);
+    row.tags = [...new Set([...ensureArray(existing.tags), ...ensureArray(inputRow.tags)])].slice(0, BUCKET_TAGS_MAX);
+  } else {
+    try {
+      const bucket = await findBestBucketForMemory(row) || buildBucketForMemory(row);
+      applyBucketFields(row, bucket);
+    } catch (_) {}
+  }
+
+  syncRawToColumns(row);
+  const saved = await updateMemoryRowById(existing.id, row);
+  const item =
+    denormalizeMemoryRow(saved) ??
+    denormalizeMemoryRow({ ...row, id: existing.id });
+
+  log("info", "tool", {
+    tool: "memory_hold",
+    mode: "merged",
+    args: { layer, title, threshold },
+    result: {
+      matched_id: existing.id,
+      similarity: best.score,
+      considered_count: eligible.length,
+      appended_length: inputRow.content.length,
+    },
+  });
+
+  return { mode: "merged", item, matched_id: existing.id, similarity: best.score, considered_count: eligible.length };
+}
+
+// 给一条记忆追加年轮 comment（memory_comment_add 的核心逻辑，供工具与导入 commit 复用）。
+// 校验失败时抛出清晰错误。返回 { comment, comment_count }。
+async function addRingComment({ memory_id, content, author, source }) {
+  if (!isValidUuid(memory_id)) {
+    throw new Error("memory_id 必须是合法的 UUID。");
+  }
+  if (typeof content !== "string" || !content.trim()) {
+    throw new Error("content 不能为空。");
+  }
+  const row = await readMemoryById(memory_id);
+  if (!row) {
+    throw new Error("未找到对应记忆（memory_id 不存在）。");
+  }
+  const raw = ensureObject(row.raw, {});
+  const comment = makeComment({ content, author, source, maxLen: STR_LIMITS.note });
+  const nextComments = appendComment(raw.ring_comments, comment);
+  const nextRaw = { ...raw, ring_comments: nextComments };
+
+  const client = getSupabaseClient();
+  const { error } = await client
+    .from(MEMORY_TABLE)
+    .update({ raw: nextRaw, updated_at: new Date().toISOString() })
+    .eq("id", memory_id);
+  if (error) throw toDbError("memory_comment_add failed", error);
+
+  return { comment, comment_count: nextComments.length };
+}
+
 function createServer() {
   const server = new McpServer({
     name: "memory-mcp",
@@ -2396,229 +2646,14 @@ function createServer() {
         considered_count: z.number(),
       }),
     },
-    async ({
-      content,
-      title,
-      layer = "daily",
-      sub_layer,
-      author,
-      mood,
-      keywords,
-      profiles,
-      pinned,
-      protected: protectedFlag,
-      importance = 2,
-      date,
-      today_snapshot,
-      chord_tag,
-      anchor,
-      confidence,
-      intimacy,
-      safety,
-      texture,
-      bucket,
-      merge = true,
-      threshold = 0.55,
-      limit = 20,
-    }) => {
-      const inputRow = buildMemoryRow({ content, title, layer, sub_layer, author, mood, keywords, profiles, importance, date, today_snapshot, anchor, confidence, intimacy, safety, texture, bucket });
-
-      // Apply pinned/protected to inputRow (only-raise; pinned forces protected)
-      if (pinned) { inputRow.raw.pinned = true; inputRow.raw.protected = true; }
-      else if (protectedFlag) { inputRow.raw.protected = true; }
-      // chord_tag: only persist for diary/treasure; ignored on other layers
-      if (chord_tag !== undefined && (layer === "diary" || layer === "treasure")) {
-        if (chord_tag.trim()) inputRow.raw.chord_tag = chord_tag;
-        else delete inputRow.raw.chord_tag;
-      }
-
-      if (!merge) {
-        if (!inputRow.bucket_id) {
-          try {
-            const bucket = await findBestBucketForMemory(inputRow) || buildBucketForMemory(inputRow);
-            applyBucketFields(inputRow, bucket);
-          } catch (_) {}
-        }
-        syncRawToColumns(inputRow);
-        const saved = await insertMemoryRow(inputRow);
-        const item = denormalizeMemoryRow(saved);
-        log("info", "tool", {
-          tool: "memory_hold",
-          mode: "created",
-          args: { layer, title, keyword_count: inputRow.keywords.length },
-          result: { item_id: item?.id },
-        });
-        return makeResult(
-          { mode: "created", item, similarity: 0, considered_count: 0 },
-          `[created] id=${item?.id} | title=${item?.title || "(无)"} | similarity=0 | pinned=${item?.pinned} protected=${item?.protected} resolved=${item?.resolved} _archived=${item?._archived}`
-        );
-      }
-
-      // Build candidate pool
-      const [kwRows, titleRows, recentRows] = await Promise.all([
-        inputRow.keywords.length
-          ? queryMemoryRows({ keywords: inputRow.keywords, layer, sub_layer, limit: limit * 5 })
-          : Promise.resolve([]),
-        title
-          ? queryMemoryRows({ q: title, layer, sub_layer, limit: limit * 3 })
-          : Promise.resolve([]),
-        readMemoryRows({ layer, sub_layer, limit: limit * 3 }),
-      ]);
-
-      const seen = new Set();
-      const candidates = [];
-      for (const r of [...kwRows, ...titleRows, ...recentRows]) {
-        if (r?.id && !seen.has(r.id)) {
-          seen.add(r.id);
-          const den = denormalizeMemoryRow(r);
-          if (den) candidates.push(den);
-        }
-      }
-
-      // Filter: no archived, no resolved
-      const eligible = candidates.filter((m) => !m._archived && !m.resolved);
-
-      // Score each candidate
-      const scored = eligible
-        .map((m) => ({ m, score: calcHoldSimilarity(inputRow, m) }))
-        .sort((a, b) => b.score - a.score);
-
-      const best = scored[0];
-
-      if (!best || best.score < threshold) {
-        if (!inputRow.bucket_id) {
-          try {
-            const bucket = await findBestBucketForMemory(inputRow) || buildBucketForMemory(inputRow);
-            applyBucketFields(inputRow, bucket);
-          } catch (_) {}
-        }
-        syncRawToColumns(inputRow);
-        const saved = await insertMemoryRow(inputRow);
-        const item = denormalizeMemoryRow(saved);
-        log("info", "tool", {
-          tool: "memory_hold",
-          mode: "created",
-          args: { layer, title, threshold },
-          result: { item_id: item?.id, best_score: best?.score ?? 0, considered_count: eligible.length },
-        });
-        return makeResult(
-          { mode: "created", item, similarity: best?.score ?? 0, considered_count: eligible.length },
-          `[created] id=${item?.id} | title=${item?.title || "(无)"} | similarity=${best?.score ?? 0} | pinned=${item?.pinned} protected=${item?.protected} resolved=${item?.resolved} _archived=${item?._archived}`
-        );
-      }
-
-      // Merge into best match
-      const existing = best.m;
-      const existingRaw = ensureObject(existing.raw, {});
-
-      const appendDate = (date || new Date().toISOString()).slice(0, 10);
-      const mergedContent =
-        String(existing.content || "") +
-        `\n\n---\n补充于 ${appendDate}：\n${inputRow.content}`;
-
-      const mergedKeywords = [
-        ...new Set([...ensureArray(existing.keywords), ...inputRow.keywords]),
-      ];
-      const mergedProfiles = [
-        ...new Set([...effectiveProfiles(existing.profiles), ...inputRow.profiles]),
-      ];
-      const mergedImportance = Math.max(
-        Number(existing.importance) || 0,
-        inputRow.importance
-      );
-
-      const now = new Date().toISOString();
-      const newRaw = {
-        ...existingRaw,
-        activation_count:
-          (Number(existingRaw.activation_count ?? existing.activation_count) || 0) + 1,
-        last_active: now,
-      };
-      // Preserve existing pinned/protected — never lower them on merge
-      if (existing.pinned) newRaw.pinned = true;
-      if (existing.protected) newRaw.protected = true;
-      // Apply incoming pinned/protected — only raise, never lower
-      if (pinned) { newRaw.pinned = true; newRaw.protected = true; }
-      else if (protectedFlag) { newRaw.protected = true; }
-      // today_snapshot: new value overrides existing when provided
-      if (today_snapshot !== undefined) newRaw.today_snapshot = today_snapshot;
-      // chord_tag: only overlay for diary/treasure; trim-empty deletes
-      if (chord_tag !== undefined && (layer === "diary" || layer === "treasure")) {
-        if (chord_tag.trim()) newRaw.chord_tag = chord_tag;
-        else delete newRaw.chord_tag;
-      }
-      // New compat fields: overlay when explicitly passed in, otherwise existingRaw value is already in newRaw via spread
-      if (anchor !== undefined) newRaw.anchor = Boolean(anchor);
-      if (confidence !== undefined) newRaw.confidence = confidence;
-      if (intimacy !== undefined) newRaw.intimacy = intimacy;
-      if (safety !== undefined) newRaw.safety = safety;
-      if (texture !== undefined) newRaw.texture = texture;
-      if (bucket !== undefined) newRaw.bucket = bucket;
-
-      const mergeInput = { ...existing };
-      // Strip top-level compat fields before buildMemoryRow to prevent override
-      for (const field of RAW_COMPAT_FIELDS) delete mergeInput[field];
-      delete mergeInput.digested;
-
-      mergeInput.content = mergedContent;
-      mergeInput.keywords = mergedKeywords;
-      mergeInput.profiles = mergedProfiles;
-      mergeInput.importance = mergedImportance;
-      if (mood) mergeInput.mood = mood;
-      if (author) mergeInput.author = author;
-      mergeInput.raw = newRaw;
-      mergeInput.id = existing.id;
-
-      const row = buildMemoryRow(mergeInput, { isUpdate: true });
-      // Force-preserve values that buildMemoryRow might not carry
-      if (newRaw.pinned) row.raw.pinned = true;
-      if (newRaw.protected) row.raw.protected = true;
-      if (existingRaw.digested !== undefined) row.raw.digested = existingRaw.digested;
-      row.raw.activation_count = newRaw.activation_count;
-      row.raw.last_active = now;
-
-      // Bucket: prefer existing bucket; only auto-assign if existing has none
-      if (existing.bucket_id) {
-        row.bucket_id = existing.bucket_id;
-        row.bucket_type = existing.bucket_type || inferBucketType(existing.layer || "daily");
-        row.name = existing.name || "";
-        row.domain = ensureArray(existing.domain);
-        row.tags = [...new Set([...ensureArray(existing.tags), ...ensureArray(inputRow.tags)])].slice(0, BUCKET_TAGS_MAX);
-      } else {
-        try {
-          const bucket = await findBestBucketForMemory(row) || buildBucketForMemory(row);
-          applyBucketFields(row, bucket);
-        } catch (_) {}
-      }
-
-      syncRawToColumns(row);
-      const saved = await updateMemoryRowById(existing.id, row);
-      const item =
-        denormalizeMemoryRow(saved) ??
-        denormalizeMemoryRow({ ...row, id: existing.id });
-
-      log("info", "tool", {
-        tool: "memory_hold",
-        mode: "merged",
-        args: { layer, title, threshold },
-        result: {
-          matched_id: existing.id,
-          similarity: best.score,
-          considered_count: eligible.length,
-          appended_length: inputRow.content.length,
-        },
-      });
-
-      return makeResult(
-        {
-          mode: "merged",
-          item,
-          matched_id: existing.id,
-          similarity: best.score,
-          considered_count: eligible.length,
-        },
-        `[merged] id=${item?.id} | matched_id=${existing.id} | similarity=${best.score} threshold=${threshold} | appended=${inputRow.content.length}chars | pinned=${item?.pinned} protected=${item?.protected} resolved=${item?.resolved} _archived=${item?._archived}`
-      );
+    async (args) => {
+      const result = await holdMemory(args);
+      const item = result.item;
+      const text =
+        result.mode === "created"
+          ? `[created] id=${item?.id} | title=${item?.title || "(无)"} | similarity=${result.similarity} | pinned=${item?.pinned} protected=${item?.protected} resolved=${item?.resolved} _archived=${item?._archived}`
+          : `[merged] id=${item?.id} | matched_id=${result.matched_id} | similarity=${result.similarity} | pinned=${item?.pinned} protected=${item?.protected} resolved=${item?.resolved} _archived=${item?._archived}`;
+      return makeResult(result, text);
     }
   );
 
@@ -4217,41 +4252,14 @@ function createServer() {
       }),
     },
     async ({ memory_id, content, author, source }) => {
-      if (!isValidUuid(memory_id)) {
-        throw new Error("memory_id 必须是合法的 UUID。");
-      }
-      if (typeof content !== "string" || !content.trim()) {
-        throw new Error("content 不能为空。");
-      }
-      const row = await readMemoryById(memory_id);
-      if (!row) {
-        throw new Error("未找到对应记忆（memory_id 不存在）。");
-      }
-
-      const raw = ensureObject(row.raw, {});
-      const comment = makeComment({ content, author, source, maxLen: STR_LIMITS.note });
-      const nextComments = appendComment(raw.ring_comments, comment);
-      const nextRaw = { ...raw, ring_comments: nextComments };
-
-      const client = getSupabaseClient();
-      const { error } = await client
-        .from(MEMORY_TABLE)
-        .update({ raw: nextRaw, updated_at: new Date().toISOString() })
-        .eq("id", memory_id);
-      if (error) throw toDbError("memory_comment_add failed", error);
-
-      const result = {
-        ok: true,
-        memory_id,
-        comment,
-        comment_count: nextComments.length,
-      };
+      const { comment, comment_count } = await addRingComment({ memory_id, content, author, source });
+      const result = { ok: true, memory_id, comment, comment_count };
       log("info", "tool", {
         tool: "memory_comment_add",
         args: { memory_id, content_chars: content.trim().length, author: author ?? null, source: source ?? null },
-        result: { comment_id: comment.id, comment_count: result.comment_count },
+        result: { comment_id: comment.id, comment_count },
       });
-      return makeResult(result, `已添加年轮 comment（id=${comment.id}），当前共 ${result.comment_count} 条。`);
+      return makeResult(result, `已添加年轮 comment（id=${comment.id}），当前共 ${comment_count} 条。`);
     }
   );
 
@@ -4418,6 +4426,157 @@ function createServer() {
       const summary =
         `候选抽取完成：${result.chunk_count} 个分块，抽出 ${result.candidate_count} 条候选记忆（未写入，待人工确认）。`;
       return makeResult(result, summary);
+    }
+  );
+
+  server.registerTool(
+    "memory_import_candidate_commit",
+    {
+      title: "Memory Import Candidate Commit",
+      description:
+        "把人工确认后的导入候选写入正式记忆或年轮 comment（导入闭环的最后一步）。" +
+        "dry_run 默认 true：只规划、不写库，返回每条候选会执行什么。dry_run=false 才真正写入。" +
+        "preference/project/memory/diary → memory_hold（默认 layer：preference=core、project=memo、memory=treasure、diary=diary）；" +
+        "comment → 追加 raw.ring_comments，需要合法 target_memory_id，缺失则 needs_target；content 为空则 invalid。" +
+        "不支持 kind=ignore。单条失败不影响后续候选。raw 里会保留 import_source / import_confidence / import_kind / import_committed_at。" +
+        " English aliases: commit import candidates, write candidates to memory, apply candidate pool, import commit.",
+      inputSchema: z.object({
+        candidates: z.array(
+          z.object({
+            kind: z.enum(["memory", "comment", "preference", "project", "diary"]),
+            title: z.string().optional(),
+            content: z.string(),
+            suggested_layer: z.string().optional(),
+            keywords: z.array(z.string()).optional(),
+            importance: z.number().optional(),
+            confidence: z.number().optional(),
+            source: z.string().optional(),
+            target_memory_id: z.string().optional(),
+            target_memory_hint: z.string().optional(),
+            author: z.string().optional(),
+            date: z.string().optional(),
+          })
+        ),
+        dry_run: z.boolean().optional().default(true),
+        merge: z.boolean().optional().default(true),
+      }),
+      outputSchema: z.object({
+        dry_run: z.boolean(),
+        committed_count: z.number(),
+        skipped_count: z.number(),
+        results: z.array(
+          z.object({
+            index: z.number(),
+            status: z.enum([
+              "would_create",
+              "created",
+              "merged",
+              "would_comment",
+              "commented",
+              "needs_target",
+              "invalid",
+              "error",
+            ]),
+            kind: z.string(),
+            memory_id: z.string().optional(),
+            comment_id: z.string().optional(),
+            message: z.string(),
+          })
+        ),
+      }),
+    },
+    async ({ candidates, dry_run = true, merge = true }) => {
+      const plans = planCommit(candidates);
+      const results = [];
+      let committed = 0;
+      let skipped = 0;
+
+      for (const plan of plans) {
+        const base = { index: plan.index, kind: plan.kind ?? "" };
+
+        // 规划阶段就已判定无法写入（invalid / needs_target）。
+        if (plan.action === "skip") {
+          results.push({ ...base, status: plan.status, message: plan.message });
+          skipped++;
+          continue;
+        }
+
+        // dry_run：只返回会执行什么，不写库。
+        if (dry_run) {
+          const extra = {};
+          if (plan.action === "comment") extra.memory_id = plan.comment.memory_id;
+          results.push({ ...base, status: plan.status, message: plan.message, ...extra });
+          continue;
+        }
+
+        // 真正写入。单条失败不影响后续。
+        try {
+          if (plan.action === "comment") {
+            const cand = candidates[plan.index];
+            const { comment, comment_count } = await addRingComment({
+              memory_id: plan.comment.memory_id,
+              content: plan.comment.content,
+              author: plan.comment.author,
+              source: plan.comment.source || cand?.source,
+            });
+            results.push({
+              ...base,
+              status: "commented",
+              memory_id: plan.comment.memory_id,
+              comment_id: comment.id,
+              message: `已追加年轮 comment（id=${comment.id}），目标记忆现有 ${comment_count} 条。`,
+            });
+            committed++;
+          } else {
+            // hold：附带导入溯源信息进 raw。
+            const cand = candidates[plan.index];
+            const holdResult = await holdMemory({
+              ...plan.hold,
+              merge,
+              raw: {
+                import_source: cand?.source ?? "",
+                import_confidence: typeof cand?.confidence === "number" ? cand.confidence : null,
+                import_kind: plan.kind,
+                import_committed_at: new Date().toISOString(),
+              },
+            });
+            const item = holdResult.item;
+            results.push({
+              ...base,
+              status: holdResult.mode, // "created" | "merged"
+              memory_id: item?.id,
+              message:
+                holdResult.mode === "merged"
+                  ? `已合并进已有记忆（id=${item?.id}，similarity=${holdResult.similarity}）。`
+                  : `已新建记忆（id=${item?.id}，layer=${plan.layer}）。`,
+            });
+            committed++;
+          }
+        } catch (err) {
+          results.push({
+            ...base,
+            status: "error",
+            message: err instanceof Error ? err.message : String(err),
+          });
+          skipped++;
+        }
+      }
+
+      const out = {
+        dry_run,
+        committed_count: committed,
+        skipped_count: skipped,
+        results,
+      };
+      log("info", "tool", {
+        tool: "memory_import_candidate_commit",
+        args: { candidate_count: Array.isArray(candidates) ? candidates.length : 0, dry_run, merge },
+        result: { committed_count: committed, skipped_count: skipped },
+      });
+      const summary = dry_run
+        ? `dry_run：规划 ${plans.length} 条候选（未写入）。可写 ${plans.filter((p) => p.action !== "skip").length} 条，跳过 ${skipped} 条。`
+        : `提交完成：写入 ${committed} 条，跳过/失败 ${skipped} 条。`;
+      return makeResult(out, summary);
     }
   );
 
