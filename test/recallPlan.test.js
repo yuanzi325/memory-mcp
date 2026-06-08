@@ -81,6 +81,39 @@ test("layers 去重并去空白", () => {
   assert.deepEqual(p.layers, ["memo", "core"]);
 });
 
+test("layers=['memo'] 时 bucket 上下文不使用非 memo 记忆", () => {
+  // 模拟同一个 bucket 里混有 memo / diary / treasure 的记忆。
+  const bucketMems = [
+    { id: "1", layer: "memo", importance: 3, content: "memo: deploy notes" },
+    { id: "2", layer: "diary", importance: 9, content: "diary: 今天好累" },
+    { id: "3", layer: "treasure", importance: 8, content: "treasure: 我们的约定" },
+    { id: "4", layer: "memo", importance: 5, content: "memo: usage dashboard" },
+  ];
+  const plan = resolveRecallPlan({ layers: ["memo"] });
+
+  // 复用 server.js 中相同的过滤谓词。
+  const filtered = plan.layers ? bucketMems.filter((m) => layerAllowed(plan, m.layer)) : bucketMems;
+
+  assert.deepEqual(filtered.map((m) => m.id), ["1", "4"], "只应保留 memo 记忆");
+  assert.ok(filtered.every((m) => m.layer === "memo"));
+
+  // summary_snippet 取自最高 importance 的记忆——必须仍是 memo，而不是 diary(9)/treasure(8)。
+  const topMem = [...filtered].sort((a, b) => b.importance - a.importance)[0];
+  assert.equal(topMem.layer, "memo");
+  assert.equal(topMem.id, "4");
+  assert.ok(!topMem.content.includes("diary") && !topMem.content.includes("treasure"));
+});
+
+test("不传 layers 时 bucket 上下文保留全部 layer（不回归）", () => {
+  const bucketMems = [
+    { id: "1", layer: "memo" },
+    { id: "2", layer: "diary" },
+  ];
+  const plan = resolveRecallPlan({});
+  const filtered = plan.layers ? bucketMems.filter((m) => layerAllowed(plan, m.layer)) : bucketMems;
+  assert.equal(filtered.length, 2, "不限制时 bucket 摘要可取任意 layer 作为背景");
+});
+
 test("resolveRecallPlan 是纯函数（同输入同输出）", () => {
   const a = resolveRecallPlan({ depth: "deep", layers: ["memo", "core"] });
   const b = resolveRecallPlan({ depth: "deep", layers: ["memo", "core"] });

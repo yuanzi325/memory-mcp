@@ -1482,6 +1482,9 @@ async function buildRecallContext({
         const bRows = await readMemoryRowsByBucketId(bid, { limit: 50 });
         let bMems = filterClosed(bRows.map(denormalizeMemoryRow).filter(Boolean));
         bMems = bMems.filter((m) => matchesProfileFilter(m, profile));
+        // 尊重 layers 计划：bucket 摘要也只能取允许的 layer，避免 layers=["memo"] 时
+        // 从同 bucket 的 diary/treasure 记忆里取 summary_snippet 造成跨 layer 泄漏。
+        if (plan.layers) bMems = bMems.filter((m) => layerAllowed(plan, m.layer));
         if (!bMems.length) return null;
         const topMem = [...bMems].sort((a, b) => (Number(b.importance) || 0) - (Number(a.importance) || 0))[0];
         const raw = String(topMem.content || topMem.title || "");
