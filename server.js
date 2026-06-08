@@ -7,6 +7,13 @@ import * as z from "zod";
 import { evaluateSentinel } from "./sentinel.js";
 import { resolveRecallPlan, layerAllowed } from "./recallPlan.js";
 import { planSmartRecall } from "./smartRecall.js";
+import {
+  normalizeComments,
+  makeComment,
+  sortCommentsAsc,
+  appendComment,
+  removeComment,
+} from "./ringComments.js";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -4174,6 +4181,178 @@ function createServer() {
       });
 
       return makeResult(out, recall.context_text);
+    }
+  );
+
+  // ─── 年轮 comments（raw.ring_comments，与前端 MVP 兼容） ──────────────────
+  const ringCommentSchema = z.object({
+    id: z.string(),
+    created_at: z.string(),
+    author: z.string(),
+    source: z.string(),
+    content: z.string(),
+  });
+
+  server.registerTool(
+    "memory_comment_add",
+    {
+      title: "Memory Comment Add",
+      description:
+        "给一条记忆追加一条「年轮 comment」（写入 memory.raw.ring_comments 末尾），用于「旧记忆被重新理解/补注」。" +
+        "只追加 comment，不改 memory content，不改 resolved/digested/protected 等状态，不覆盖 raw 里其它字段。" +
+        "content trim 后不能为空。返回新建的 comment 与 comment_count。" +
+        " English aliases: add ring comment, annotate memory, comment on memory, append memory note.",
+      inputSchema: z.object({
+        memory_id: z.string(),
+        content: z.string(),
+        author: z.string().optional(),
+        source: z.string().optional(),
+      }),
+      outputSchema: z.object({
+        ok: z.boolean(),
+        memory_id: z.string(),
+        comment: ringCommentSchema,
+        comment_count: z.number(),
+      }),
+    },
+    async ({ memory_id, content, author, source }) => {
+      if (!isValidUuid(memory_id)) {
+        throw new Error("memory_id 必须是合法的 UUID。");
+      }
+      if (typeof content !== "string" || !content.trim()) {
+        throw new Error("content 不能为空。");
+      }
+      const row = await readMemoryById(memory_id);
+      if (!row) {
+        throw new Error("未找到对应记忆（memory_id 不存在）。");
+      }
+
+      const raw = ensureObject(row.raw, {});
+      const comment = makeComment({ content, author, source, maxLen: STR_LIMITS.note });
+      const nextComments = appendComment(raw.ring_comments, comment);
+      const nextRaw = { ...raw, ring_comments: nextComments };
+
+      const client = getSupabaseClient();
+      const { error } = await client
+        .from(MEMORY_TABLE)
+        .update({ raw: nextRaw, updated_at: new Date().toISOString() })
+        .eq("id", memory_id);
+      if (error) throw toDbError("memory_comment_add failed", error);
+
+      const result = {
+        ok: true,
+        memory_id,
+        comment,
+        comment_count: nextComments.length,
+      };
+      log("info", "tool", {
+        tool: "memory_comment_add",
+        args: { memory_id, content_chars: content.trim().length, author: author ?? null, source: source ?? null },
+        result: { comment_id: comment.id, comment_count: result.comment_count },
+      });
+      return makeResult(result, `已添加年轮 comment（id=${comment.id}），当前共 ${result.comment_count} 条。`);
+    }
+  );
+
+  server.registerTool(
+    "memory_comment_list",
+    {
+      title: "Memory Comment List",
+      description:
+        "读取一条记忆的「年轮 comments」（raw.ring_comments），按 created_at 升序返回。" +
+        "只读，不写入、不 touch。没有 comments 时返回空数组。" +
+        " English aliases: list ring comments, read memory comments, get memory annotations.",
+      inputSchema: z.object({
+        memory_id: z.string(),
+      }),
+      outputSchema: z.object({
+        memory_id: z.string(),
+        comments: z.array(ringCommentSchema),
+        comment_count: z.number(),
+      }),
+    },
+    async ({ memory_id }) => {
+      if (!isValidUuid(memory_id)) {
+        throw new Error("memory_id 必须是合法的 UUID。");
+      }
+      const row = await readMemoryById(memory_id);
+      if (!row) {
+        throw new Error("未找到对应记忆（memory_id 不存在）。");
+      }
+      const raw = ensureObject(row.raw, {});
+      const comments = sortCommentsAsc(raw.ring_comments);
+
+      const result = { memory_id, comments, comment_count: comments.length };
+      log("info", "tool", {
+        tool: "memory_comment_list",
+        args: { memory_id },
+        result: { comment_count: result.comment_count },
+      });
+      return makeResult(result, `该记忆共有 ${result.comment_count} 条年轮 comment。`);
+    }
+  );
+
+  server.registerTool(
+    "memory_comment_delete",
+    {
+      title: "Memory Comment Delete",
+      description:
+        "从一条记忆的 raw.ring_comments 中按 comment_id 删除一条年轮 comment。" +
+        "comment 不存在时返回 deleted=false（不报错）。不覆盖 raw 里其它字段，不改 memory content。" +
+        " English aliases: delete ring comment, remove memory comment, drop memory annotation.",
+      inputSchema: z.object({
+        memory_id: z.string(),
+        comment_id: z.string(),
+      }),
+      outputSchema: z.object({
+        ok: z.boolean(),
+        memory_id: z.string(),
+        deleted: z.boolean(),
+        comment_count: z.number(),
+      }),
+    },
+    async ({ memory_id, comment_id }) => {
+      if (!isValidUuid(memory_id)) {
+        throw new Error("memory_id 必须是合法的 UUID。");
+      }
+      if (typeof comment_id !== "string" || !comment_id.trim()) {
+        throw new Error("comment_id 不能为空。");
+      }
+      const row = await readMemoryById(memory_id);
+      if (!row) {
+        throw new Error("未找到对应记忆（memory_id 不存在）。");
+      }
+      const raw = ensureObject(row.raw, {});
+      const { comments: nextComments, deleted } = removeComment(raw.ring_comments, comment_id);
+
+      // 只有真的删掉了才写库，避免无谓的 updated_at 抖动。
+      if (deleted) {
+        const nextRaw = { ...raw, ring_comments: nextComments };
+        const client = getSupabaseClient();
+        const { error } = await client
+          .from(MEMORY_TABLE)
+          .update({ raw: nextRaw, updated_at: new Date().toISOString() })
+          .eq("id", memory_id);
+        if (error) throw toDbError("memory_comment_delete failed", error);
+      }
+
+      const result = {
+        ok: true,
+        memory_id,
+        deleted,
+        comment_count: deleted ? nextComments.length : normalizeComments(raw.ring_comments).length,
+      };
+      log("info", "tool", {
+        tool: "memory_comment_delete",
+        args: { memory_id, comment_id },
+        result: { deleted, comment_count: result.comment_count },
+      });
+      return makeResult(
+        result,
+        deleted
+          ? `已删除年轮 comment（id=${comment_id}），当前共 ${result.comment_count} 条。`
+          : `未找到 comment（id=${comment_id}），未做改动，当前共 ${result.comment_count} 条。`
+      );
     }
   );
 
