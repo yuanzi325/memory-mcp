@@ -108,6 +108,46 @@ test("add → list → delete 全流程", () => {
   assert.equal(del.comments[0].id, "rc_2");
 });
 
-test("normalizeComments 过滤非对象项", () => {
-  assert.deepEqual(normalizeComments([{ id: "a" }, null, "x", 3, { id: "b" }]), [{ id: "a" }, { id: "b" }]);
+test("normalizeComments 过滤非对象项并规整 shape", () => {
+  // 非对象项被过滤；对象项补齐字段；content 为空的被丢弃。
+  const out = normalizeComments([
+    { id: "a", content: "有内容" },
+    null,
+    "x",
+    3,
+    { id: "b" }, // 无 content → 丢弃
+  ]);
+  assert.equal(out.length, 1);
+  assert.deepEqual(out[0], { id: "a", created_at: "", author: "", source: "", content: "有内容" });
+});
+
+test("旧前端 comment 缺 source 时 list/sort 后 source === ''（兼容修复）", () => {
+  // 模拟旧前端写入的年轮：没有 source 字段。
+  const legacy = [
+    { id: "rc_old1", created_at: "2026-02-01T00:00:00.000Z", author: "沅沅", content: "旧年轮 2" },
+    { id: "rc_old0", created_at: "2026-01-01T00:00:00.000Z", author: "沅沅", content: "旧年轮 1" },
+  ];
+
+  // normalizeComments 直接补齐
+  const normalized = normalizeComments(legacy);
+  assert.ok(normalized.every((c) => c.source === ""), "缺 source 应补齐为空字符串");
+  assert.ok(normalized.every((c) => typeof c.id === "string" && typeof c.created_at === "string"));
+
+  // sortCommentsAsc（list 用的）也产出符合 schema 的对象
+  const listed = sortCommentsAsc(legacy);
+  assert.deepEqual(listed.map((c) => c.id), ["rc_old0", "rc_old1"]);
+  for (const c of listed) {
+    assert.deepEqual(Object.keys(c).sort(), ["author", "content", "created_at", "id", "source"]);
+    assert.equal(c.source, "");
+  }
+});
+
+test("旧坏数据：content 为空的 comment 被过滤掉", () => {
+  const mixed = [
+    { id: "ok", created_at: "t", author: "a", content: "保留" },
+    { id: "blank", created_at: "t", author: "a", content: "   " },
+    { id: "missing", created_at: "t", author: "a" },
+  ];
+  const out = normalizeComments(mixed);
+  assert.deepEqual(out.map((c) => c.id), ["ok"]);
 });

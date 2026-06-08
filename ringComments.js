@@ -6,9 +6,25 @@
 
 import { randomUUID } from "node:crypto";
 
-// 把任意 raw.ring_comments 值规整成「对象数组」。
+// 把任意 raw.ring_comments 值规整成「形状一致的对象数组」。
+// - 兼容旧前端年轮：缺 source（或任意字段）时补齐为 ""，保证匹配 MCP outputSchema。
+// - 丢弃 content 规整后为空的坏数据。
 export function normalizeComments(value) {
-  return Array.isArray(value) ? value.filter((c) => c && typeof c === "object") : [];
+  if (!Array.isArray(value)) return [];
+  const out = [];
+  for (const c of value) {
+    if (!c || typeof c !== "object") continue;
+    const content = c.content != null ? String(c.content) : "";
+    if (!content.trim()) continue;
+    out.push({
+      id: c.id != null ? String(c.id) : "",
+      created_at: c.created_at != null ? String(c.created_at) : "",
+      author: c.author != null ? String(c.author) : "",
+      source: c.source != null ? String(c.source) : "",
+      content,
+    });
+  }
+  return out;
 }
 
 /**
