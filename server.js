@@ -4,6 +4,7 @@ import { createClient } from "@supabase/supabase-js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import * as z from "zod";
+import { evaluateSentinel } from "./sentinel.js";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -3781,6 +3782,65 @@ function createServer() {
       });
 
       return makeResult(result, briefingText);
+    }
+  );
+
+  server.registerTool(
+    "memory_sentinel",
+    {
+      title: "Memory Sentinel",
+      description:
+        "前置判断层：在调用 recall_context 之前，判断这一轮是否需要召回记忆、该查什么词、查多深。" +
+        "它只做规划/判断，不读数据库、不调用 recall_context、不写入任何记忆，保持无副作用。" +
+        "返回 need_recall（是否召回）、depth（none/shallow/normal/deep）、q（具体检索词）、" +
+        "layers（建议限定的 layer，可为空表示不限制）、reason（判断理由）、touch_recommended（是否建议 touch）。" +
+        "调用策略 — 普通寒暄、亲亲抱抱、简单情绪回应、当前上下文已足够时返回 need_recall=false；" +
+        "用户说「还记得吗 / 上次 / 之前 / 接着那个 / 翻一下记忆」或提到具体旧项目/旧人/旧设定/长期偏好时返回 need_recall=true。" +
+        "q 必须是具体检索词，不要用「用户 / 沅沅 / 今天」这种泛词。" +
+        "典型用法：先调 memory_sentinel，若 need_recall=true 则把它给出的 q / layer / touch 建议传给 recall_context；" +
+        "若 need_recall=false 则跳过 recall_context，直接回应。" +
+        "English — a pre-flight gate that decides, before recall_context, whether this turn needs memory recall, what to search for, and how deep. " +
+        "It is side-effect free: no DB reads, no recall_context call, no writes. " +
+        "Returns need_recall, depth, q, layers, reason, touch_recommended. " +
+        "English aliases: should I recall, memory gate, recall sentinel, recall planner, decide recall.",
+      inputSchema: z.object({
+        message: z.string(),
+        profile: z.enum(["shared", "rowan", "arion", "all"]).optional(),
+        recent_context: z.string().optional(),
+      }),
+      outputSchema: z.object({
+        need_recall: z.boolean(),
+        depth: z.enum(["none", "shallow", "normal", "deep"]),
+        q: z.string(),
+        layers: z.array(z.string()),
+        reason: z.string(),
+        touch_recommended: z.boolean(),
+      }),
+    },
+    async ({ message, profile, recent_context }) => {
+      const result = evaluateSentinel({ message, profile, recent_context });
+
+      log("info", "tool", {
+        tool: "memory_sentinel",
+        args: {
+          message_chars: typeof message === "string" ? message.length : 0,
+          profile: profile ?? null,
+          recent_context_chars: typeof recent_context === "string" ? recent_context.length : 0,
+        },
+        result: {
+          need_recall: result.need_recall,
+          depth: result.depth,
+          q: result.q,
+          layers: result.layers,
+          touch_recommended: result.touch_recommended,
+        },
+      });
+
+      const summary = result.need_recall
+        ? `memory_sentinel：need_recall=true, depth=${result.depth}, q="${result.q}", layers=[${result.layers.join(", ")}], touch_recommended=${result.touch_recommended}。${result.reason}`
+        : `memory_sentinel：need_recall=false（无需召回记忆）。${result.reason}`;
+
+      return makeResult(result, summary);
     }
   );
 
