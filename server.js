@@ -14,6 +14,7 @@ import {
   appendComment,
   removeComment,
 } from "./ringComments.js";
+import { extractCandidates } from "./importCandidates.js";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -4353,6 +4354,70 @@ function createServer() {
           ? `已删除年轮 comment（id=${comment_id}），当前共 ${result.comment_count} 条。`
           : `未找到 comment（id=${comment_id}），未做改动，当前共 ${result.comment_count} 条。`
       );
+    }
+  );
+
+  // ─── 历史聊天导入候选池 P0（只抽候选，不写正式 memories） ──────────────────
+  server.registerTool(
+    "memory_import_candidate_extract",
+    {
+      title: "Memory Import Candidate Extract",
+      description:
+        "把一段历史聊天/Markdown 文本切块、轻量规则抽取出「候选记忆」，供人工审查。" +
+        "P0：纯文本输入，不用大模型/embedding，不读写数据库，不调用 memory_hold / memory_comment_add，只产出候选。" +
+        "只抽有长期价值的内容：明确偏好、雷区/边界、关系设定、项目长期上下文、重要事件、可挂年轮的新理解、稳定互动偏好。" +
+        "不抽：普通寒暄、一次性情绪、无上下文的「哈哈/嗯嗯/抱抱」、临时手机活动、未确认推测。" +
+        "每个候选含 kind（memory/comment/preference/project/diary/ignore）、suggested_layer、importance、confidence、reason、target_memory_hint 与简短 raw_excerpt（不会整段倒出长聊天）。" +
+        "人工确认后再由后续的 commit 工具写入正式记忆。" +
+        " English aliases: extract memory candidates, import chat history, candidate pool, mine memories from chat.",
+      inputSchema: z.object({
+        text: z.string(),
+        source: z.string().optional(),
+        profile: z.enum(["shared", "rowan", "arion", "all"]).optional().default("shared"),
+        chunk_chars: z.number().int().min(500).max(20000).optional().default(6000),
+        max_candidates: z.number().int().min(1).max(200).optional().default(50),
+      }),
+      outputSchema: z.object({
+        source: z.string(),
+        profile: z.string(),
+        chunk_count: z.number(),
+        candidate_count: z.number(),
+        candidates: z.array(
+          z.object({
+            id: z.string(),
+            source: z.string(),
+            kind: z.enum(["memory", "comment", "preference", "project", "diary", "ignore"]),
+            title: z.string(),
+            content: z.string(),
+            suggested_layer: z.string(),
+            keywords: z.array(z.string()),
+            importance: z.number(),
+            confidence: z.number(),
+            reason: z.string(),
+            target_memory_hint: z.string(),
+            raw_excerpt: z.string(),
+          })
+        ),
+      }),
+    },
+    async ({ text, source, profile = "shared", chunk_chars = 6000, max_candidates = 50 }) => {
+      const result = extractCandidates({ text, source, profile, chunk_chars, max_candidates });
+
+      log("info", "tool", {
+        tool: "memory_import_candidate_extract",
+        args: {
+          text_chars: typeof text === "string" ? text.length : 0,
+          source: source ?? null,
+          profile,
+          chunk_chars,
+          max_candidates,
+        },
+        result: { chunk_count: result.chunk_count, candidate_count: result.candidate_count },
+      });
+
+      const summary =
+        `候选抽取完成：${result.chunk_count} 个分块，抽出 ${result.candidate_count} 条候选记忆（未写入，待人工确认）。`;
+      return makeResult(result, summary);
     }
   );
 
