@@ -259,6 +259,29 @@ const Q_FILLERS_EN = [
 // 句尾语气词 / 标点。
 const TRAILING_PARTICLES = ["吗", "呢", "吧", "嘛", "啊", "呀", "哈", "哦", "嗯", "哒", "呐", "啦"];
 
+// 空洞检索词：剥词后只剩这些泛动词/泛指代时，q 没有召回价值。
+// Vague leftovers — if the query collapses to only one of these, it carries no recall value.
+const VAGUE_Q = [
+  "讲",
+  "弄",
+  "说",
+  "搞",
+  "做",
+  "看",
+  "聊",
+  "想",
+  "用",
+  "整",
+  "他",
+  "她",
+  "它",
+  "这",
+  "那",
+  "事",
+  "东西",
+  "一下",
+];
+
 function findMatches(haystackLower, needles) {
   const hits = [];
   for (const n of needles) {
@@ -314,6 +337,14 @@ function buildQuery(message) {
   return work.replace(/\s+/g, " ").trim();
 }
 
+// 检索词是否太弱：剥词后为空，或只剩单个泛动词/泛指代（如「讲」「弄」「这个」）。
+function isWeakQuery(q) {
+  const compact = String(q).replace(/\s+/g, "");
+  if (compact.length === 0) return true;
+  if (compact.length <= 2 && VAGUE_Q.includes(compact)) return true;
+  return false;
+}
+
 /**
  * 判断这一轮是否需要召回记忆，并给出检索规划。
  * @param {{message?: string, profile?: string, recent_context?: string}} input
@@ -335,9 +366,12 @@ export function evaluateSentinel(input = {}) {
 
   const hasTrigger = triggers.length > 0;
   const hasDeep = deepHits.length > 0;
+  // 具体项目/技术主题 + 故障/bug 词：即使没说「上次/还记得」，也是典型的旧项目召回场景。
+  // e.g. 「记忆库 MCP 又断联了」「memory-mcp bridge 又挂了」。
+  const hasTopicFault = (projectHits.length > 0 || techHits.length > 0) && bugHits.length > 0;
 
   // ── 不需要召回 ────────────────────────────────────────────────
-  if (!message.trim() || (!hasTrigger && !hasDeep)) {
+  if (!message.trim() || (!hasTrigger && !hasDeep && !hasTopicFault)) {
     let reason;
     if (smallTalkHits.length > 0) {
       reason = `普通寒暄/情绪回应（命中「${smallTalkHits.join("、")}」），无召回信号，当前上下文足够，无需召回记忆。`;
@@ -358,6 +392,20 @@ export function evaluateSentinel(input = {}) {
 
   // ── 需要召回 ──────────────────────────────────────────────────
   const q = buildQuery(message);
+
+  // 弱检索词降级：当召回仅由宽泛触发词（如「继续/接着」）撑起、且剥词后 q 太弱时，
+  // 说明用户只是「继续讲这个」，并没有指向具体旧记忆 —— 判定无需召回。
+  // 深层信号或「主题+故障」信号足够具体，不在此降级范围内。
+  if (!hasDeep && !hasTopicFault && isWeakQuery(q)) {
+    return {
+      need_recall: false,
+      depth: "none",
+      q: "",
+      layers: [],
+      reason: `命中宽泛触发词「${triggers.slice(0, 3).join("、")}」，但剥掉触发词/泛词后检索词为「${q || "空"}」，过于空洞、未指向具体旧记忆，无需召回。`,
+      touch_recommended: false,
+    };
+  }
 
   // 深度判定。
   let depth;
@@ -395,7 +443,8 @@ export function evaluateSentinel(input = {}) {
     "上次那个",
     "之前说过",
   ]).length > 0;
-  const touch_recommended = (depth === "normal" || depth === "deep") && strongRequest;
+  const touch_recommended =
+    (depth === "normal" || depth === "deep") && strongRequest && !isWeakQuery(q);
 
   // reason。
   const signalParts = [];
