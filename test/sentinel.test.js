@@ -77,6 +77,31 @@ test("无副作用：返回结构稳定且字段齐全", () => {
   assert.deepEqual(r, r2);
 });
 
+test("具体技术主题+故障词（无「上次/还记得」）也应 need_recall=true", () => {
+  for (const message of ["记忆库 MCP 又断联了", "memory-mcp bridge 又挂了"]) {
+    const r = evaluateSentinel({ message });
+    assert.equal(r.need_recall, true, `expected true for: ${message}`);
+    assert.ok(r.q.length > 0, `q should be non-empty for: ${message}`);
+    assert.ok(/mcp|bridge/i.test(r.q), `q should keep the technical topic, got: ${r.q}`);
+    assert.ok(r.layers.includes("memo"), `layers should include memo, got: ${JSON.stringify(r.layers)}`);
+  }
+});
+
+test("「继续讲这个」太宽且 q 空洞，应 need_recall=false", () => {
+  const r = evaluateSentinel({ message: "继续讲这个" });
+  assert.equal(r.need_recall, false, `expected false, got: ${JSON.stringify(r)}`);
+  assert.equal(r.depth, "none");
+  assert.equal(r.q, "");
+  assert.deepEqual(r.layers, []);
+  assert.equal(r.touch_recommended, false);
+});
+
+test("「继续」配具体主题仍 need_recall=true（不被弱 q 误降级）", () => {
+  const r = evaluateSentinel({ message: "继续 status 仪表盘 usage 那个" });
+  assert.equal(r.need_recall, true);
+  assert.ok(r.q.toLowerCase().includes("status"));
+});
+
 test("空消息返回 need_recall=false", () => {
   const r = evaluateSentinel({ message: "   " });
   assert.equal(r.need_recall, false);
