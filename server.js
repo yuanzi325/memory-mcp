@@ -5,6 +5,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import * as z from "zod";
 import { evaluateSentinel } from "./sentinel.js";
+import { resolveRecallPlan, layerAllowed } from "./recallPlan.js";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -1334,8 +1335,10 @@ async function buildRecallContext({
   profile = "shared",
   layer,
   sub_layer,
-  budget_chars = 4000,
-  max_items = 20,
+  depth,
+  layers,
+  budget_chars,
+  max_items,
   include_resolved = false,
   include_digested = false,
   include_archived = false,
@@ -1346,8 +1349,14 @@ async function buildRecallContext({
   const hasQ = Boolean(ql);
   const SNIPPET_CAP = 600;
   const BUCKET_SNIPPET_CAP = 200;
-  const MAX_TIER3 = 3;
-  const MAX_BUCKETS = 5;
+
+  // 把 sentinel 的 depth/layers 翻译成具体召回参数（纯逻辑见 recallPlan.js）。
+  // 显式传入的 budget_chars / max_items 仍优先于深度默认值。
+  const plan = resolveRecallPlan({ depth, budget_chars, max_items, layers });
+  const effBudgetChars = plan.budget_chars;
+  const effMaxItems = plan.max_items;
+  const MAX_TIER3 = plan.max_tier3;
+  const MAX_BUCKETS = plan.max_buckets;
 
   function makeSnippet(m) {
     const content = String(m.content || "");
@@ -1365,7 +1374,7 @@ async function buildRecallContext({
   // ─── Tier 1: Precise Search ─────────────────────────────────────────────
   let rows = [];
   if (hasQ) {
-    const batchLimit = Math.min(600, max_items * 15);
+    const batchLimit = Math.min(600, effMaxItems * 15);
     const batches = await Promise.all([
       queryMemoryRows({ q: ql, layer, sub_layer, limit: batchLimit }),
       queryMemoryRows({ keywords: ql, layer, sub_layer, limit: batchLimit }),
@@ -1386,6 +1395,8 @@ async function buildRecallContext({
   let memories = filterClosed(rows.map(denormalizeMemoryRow).filter(Boolean));
   memories = memories.filter((m) => matchesProfileFilter(m, profile));
   if (hasQ) memories = memories.filter((m) => memoryTextMatch(m, ql));
+  // depth/layers: 当 sentinel 给出 layers 计划时，把精确命中限制在这些 layer。
+  if (plan.layers) memories = memories.filter((m) => layerAllowed(plan, m.layer));
 
   const t1Scored = memories.map((m) => {
     const { score, reason: rawReason } = scoreSearchResult(m, ql, []);
@@ -1398,7 +1409,7 @@ async function buildRecallContext({
     if (a.m.pinned !== b.m.pinned) return a.m.pinned ? -1 : 1;
     return b.score - a.score;
   });
-  const t1Candidates = t1Scored.slice(0, Math.min(max_items, 15));
+  const t1Candidates = t1Scored.slice(0, Math.min(effMaxItems, 15));
 
   // No Tier 1 hits → return empty; Tier 3 not supplemented
   if (t1Candidates.length === 0) {
@@ -1419,37 +1430,46 @@ async function buildRecallContext({
   }
 
   // ─── Tier 3: Core/Treasure (only when Tier 1 has hits) ──────────────────
+  // depth=shallow（max_tier3=0）不追加常驻背景——q 精确命中的 core/treasure 仍会经 Tier 1 出现。
+  // layers 计划若排除了 core / treasure，则对应背景层也不混入。
   const t1Ids = new Set(t1Candidates.map(({ m }) => m.id));
-  const [coreRows, treasureRows] = await Promise.all([
-    readMemoryRows({ layer: "core", limit: 100 }),
-    readMemoryRows({ layer: "treasure", limit: 100 }),
-  ]);
-  let t3Mems = filterClosed([...coreRows, ...treasureRows].map(denormalizeMemoryRow).filter(Boolean));
-  t3Mems = t3Mems.filter((m) => matchesProfileFilter(m, profile));
-  t3Mems = t3Mems.filter((m) => !t1Ids.has(m.id));
-  t3Mems.sort((a, b) => {
-    if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
-    if (a.protected !== b.protected) return a.protected ? -1 : 1;
-    const ai = Number(a.importance) || 0;
-    const bi = Number(b.importance) || 0;
-    if (ai !== bi) return bi - ai;
-    const ada = parseDateLike(a.last_active || a.updated_at) ?? new Date(0);
-    const bda = parseDateLike(b.last_active || b.updated_at) ?? new Date(0);
-    return bda.getTime() - ada.getTime();
-  });
-  const t3Candidates = t3Mems.slice(0, MAX_TIER3).map((m) => ({
-    m,
-    score: Number(m.importance) || 0,
-    reason: m.layer === "treasure" ? "treasure_background" : "core_background",
-    tier: 3,
-  }));
+  let t3Candidates = [];
+  if (plan.wantTier3) {
+    const wantCore = layerAllowed(plan, "core");
+    const wantTreasure = layerAllowed(plan, "treasure");
+    const [coreRows, treasureRows] = await Promise.all([
+      wantCore ? readMemoryRows({ layer: "core", limit: 100 }) : Promise.resolve([]),
+      wantTreasure ? readMemoryRows({ layer: "treasure", limit: 100 }) : Promise.resolve([]),
+    ]);
+    let t3Mems = filterClosed([...coreRows, ...treasureRows].map(denormalizeMemoryRow).filter(Boolean));
+    t3Mems = t3Mems.filter((m) => matchesProfileFilter(m, profile));
+    t3Mems = t3Mems.filter((m) => !t1Ids.has(m.id));
+    t3Mems.sort((a, b) => {
+      // deep：anchor 记忆优先进入常驻背景。
+      if (plan.anchorBoost && Boolean(a.anchor) !== Boolean(b.anchor)) return a.anchor ? -1 : 1;
+      if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+      if (a.protected !== b.protected) return a.protected ? -1 : 1;
+      const ai = Number(a.importance) || 0;
+      const bi = Number(b.importance) || 0;
+      if (ai !== bi) return bi - ai;
+      const ada = parseDateLike(a.last_active || a.updated_at) ?? new Date(0);
+      const bda = parseDateLike(b.last_active || b.updated_at) ?? new Date(0);
+      return bda.getTime() - ada.getTime();
+    });
+    t3Candidates = t3Mems.slice(0, MAX_TIER3).map((m) => ({
+      m,
+      score: Number(m.importance) || 0,
+      reason: m.layer === "treasure" ? "treasure_background" : "core_background",
+      tier: 3,
+    }));
+  }
 
   // ─── Apply max_items cap ─────────────────────────────────────────────────
   const allCandidates = [...t1Candidates, ...t3Candidates];
-  const omittedByMaxItems = Math.max(0, allCandidates.length - max_items);
+  const omittedByMaxItems = Math.max(0, allCandidates.length - effMaxItems);
   // Working arrays — mutated during budget enforcement
-  let t1Items = t1Candidates.slice(0, max_items);
-  let t3Items = t3Candidates.slice(0, Math.max(0, max_items - t1Items.length));
+  let t1Items = t1Candidates.slice(0, effMaxItems);
+  let t3Items = t3Candidates.slice(0, Math.max(0, effMaxItems - t1Items.length));
 
   // ─── Tier 2: Bucket Context ──────────────────────────────────────────────
   let buckets = [];
@@ -1512,7 +1532,7 @@ async function buildRecallContext({
   let budgetConstrained = false;
   let contextText = buildContextText(t1Items, t3Items, buckets, omittedByMaxItems, omittedByMaxItems > 0 ? ["max_items"] : []);
 
-  while (contextText.length > budget_chars) {
+  while (contextText.length > effBudgetChars) {
     budgetConstrained = true;
     if (buckets.length > 0) {
       // Priority 1: remove least-important bucket (last); not a memory, not counted in omittedByBudget
@@ -1527,7 +1547,7 @@ async function buildRecallContext({
       omittedByBudget++;
     } else {
       // Last resort: hard truncate — no more items to drop
-      contextText = contextText.slice(0, budget_chars);
+      contextText = contextText.slice(0, effBudgetChars);
       break;
     }
     const totalOmitted = omittedByMaxItems + omittedByBudget;
@@ -3866,14 +3886,24 @@ function createServer() {
         "q must be a concrete word/phrase from the user's turn — never use generic terms like 沅沅 / user / today. " +
         "Keep touch=false by default; only set touch=true after the recalled material is actually used to move the conversation forward. " +
         "Treat recalled content as background — never quote it back verbatim or dump briefing/recall text to the user." +
+        " depth — 配合 memory_sentinel 的输出使用，控制召回深度：" +
+        "shallow=少量精确命中、不追加常驻 core/treasure 背景、预算更小；" +
+        "normal=默认行为（精确命中 + bucket + 少量 core/treasure）；" +
+        "deep=更多 core/treasure/anchor 背景、预算更大，但仍 q-gated 且受 max_items/budget_chars 裁剪。" +
+        "显式传入的 budget_chars / max_items 永远覆盖 depth 默认值。" +
+        " layers — 配合 memory_sentinel 的输出使用：非空时把召回限制在这些 layer（如 [\"memo\"] 只召回 memo，不混入 diary/treasure）；" +
+        "与旧的单数 layer / sub_layer 参数兼容，不传时不限制。" +
+        " English — depth (shallow/normal/deep) tunes recall breadth per the memory_sentinel plan; explicit budget_chars/max_items still override depth defaults; layers restricts recalled layers. " +
         " English aliases: recall context, retrieve context, memory recall, relevant memories, context retrieval.",
       inputSchema: z.object({
         q: z.string().min(1),
         profile: z.enum(["shared", "rowan", "arion", "all"]).optional().default("shared"),
         layer: z.string().optional(),
         sub_layer: z.string().optional(),
-        budget_chars: z.number().int().min(500).max(20000).optional().default(4000),
-        max_items: z.number().int().min(1).max(50).optional().default(20),
+        depth: z.enum(["shallow", "normal", "deep"]).optional(),
+        layers: z.array(z.string()).optional(),
+        budget_chars: z.number().int().min(500).max(20000).optional(),
+        max_items: z.number().int().min(1).max(50).optional(),
         include_resolved: z.boolean().optional().default(false),
         include_digested: z.boolean().optional().default(false),
         include_archived: z.boolean().optional().default(false),
@@ -3926,8 +3956,10 @@ function createServer() {
       profile = "shared",
       layer,
       sub_layer,
-      budget_chars = 4000,
-      max_items = 20,
+      depth,
+      layers,
+      budget_chars,
+      max_items,
       include_resolved = false,
       include_digested = false,
       include_archived = false,
@@ -3939,6 +3971,8 @@ function createServer() {
         profile,
         layer,
         sub_layer,
+        depth,
+        layers,
         budget_chars,
         max_items,
         include_resolved,
@@ -3950,7 +3984,7 @@ function createServer() {
 
       log("info", "tool", {
         tool: "recall_context",
-        args: { q, profile, layer, sub_layer, budget_chars, max_items, include_resolved, include_digested, include_archived, touch, include_buckets },
+        args: { q, profile, layer, sub_layer, depth, layers, budget_chars, max_items, include_resolved, include_digested, include_archived, touch, include_buckets },
         result: {
           selected_count: result.selected_memories.length,
           bucket_count: result.selected_buckets.length,
