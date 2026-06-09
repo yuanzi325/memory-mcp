@@ -4443,7 +4443,7 @@ function createServer() {
       inputSchema: z.object({
         candidates: z.array(
           z.object({
-            kind: z.enum(["memory", "comment", "preference", "project", "diary"]),
+            kind: z.enum(["memory", "comment", "preference", "project", "diary", "ignore"]),
             title: z.string().optional(),
             content: z.string(),
             suggested_layer: z.string().optional(),
