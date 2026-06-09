@@ -15,7 +15,7 @@ import {
   removeComment,
 } from "./ringComments.js";
 import { extractCandidates } from "./importCandidates.js";
-import { planCommit, planCandidate } from "./commitCandidates.js";
+import { commitImportCandidates } from "./commitCandidates.js";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -4443,7 +4443,7 @@ function createServer() {
       inputSchema: z.object({
         candidates: z.array(
           z.object({
-            kind: z.enum(["memory", "comment", "preference", "project", "diary"]),
+            kind: z.enum(["memory", "comment", "preference", "project", "diary", "ignore"]),
             title: z.string().optional(),
             content: z.string(),
             suggested_layer: z.string().optional(),
@@ -4486,96 +4486,20 @@ function createServer() {
       }),
     },
     async ({ candidates, dry_run = true, merge = true }) => {
-      const plans = planCommit(candidates);
-      const results = [];
-      let committed = 0;
-      let skipped = 0;
-
-      for (const plan of plans) {
-        const base = { index: plan.index, kind: plan.kind ?? "" };
-
-        // 规划阶段就已判定无法写入（invalid / needs_target）。
-        if (plan.action === "skip") {
-          results.push({ ...base, status: plan.status, message: plan.message });
-          skipped++;
-          continue;
-        }
-
-        // dry_run：只返回会执行什么，不写库。
-        if (dry_run) {
-          const extra = {};
-          if (plan.action === "comment") extra.memory_id = plan.comment.memory_id;
-          results.push({ ...base, status: plan.status, message: plan.message, ...extra });
-          continue;
-        }
-
-        // 真正写入。单条失败不影响后续。
-        try {
-          if (plan.action === "comment") {
-            const cand = candidates[plan.index];
-            const { comment, comment_count } = await addRingComment({
-              memory_id: plan.comment.memory_id,
-              content: plan.comment.content,
-              author: plan.comment.author,
-              source: plan.comment.source || cand?.source,
-            });
-            results.push({
-              ...base,
-              status: "commented",
-              memory_id: plan.comment.memory_id,
-              comment_id: comment.id,
-              message: `已追加年轮 comment（id=${comment.id}），目标记忆现有 ${comment_count} 条。`,
-            });
-            committed++;
-          } else {
-            // hold：附带导入溯源信息进 raw。
-            const cand = candidates[plan.index];
-            const holdResult = await holdMemory({
-              ...plan.hold,
-              merge,
-              raw: {
-                import_source: cand?.source ?? "",
-                import_confidence: typeof cand?.confidence === "number" ? cand.confidence : null,
-                import_kind: plan.kind,
-                import_committed_at: new Date().toISOString(),
-              },
-            });
-            const item = holdResult.item;
-            results.push({
-              ...base,
-              status: holdResult.mode, // "created" | "merged"
-              memory_id: item?.id,
-              message:
-                holdResult.mode === "merged"
-                  ? `已合并进已有记忆（id=${item?.id}，similarity=${holdResult.similarity}）。`
-                  : `已新建记忆（id=${item?.id}，layer=${plan.layer}）。`,
-            });
-            committed++;
-          }
-        } catch (err) {
-          results.push({
-            ...base,
-            status: "error",
-            message: err instanceof Error ? err.message : String(err),
-          });
-          skipped++;
-        }
-      }
-
-      const out = {
-        dry_run,
-        committed_count: committed,
-        skipped_count: skipped,
-        results,
-      };
+      // MCP tool 与 REST endpoint 共用同一编排 helper，避免两边逻辑漂移。
+      const out = await commitImportCandidates(
+        { candidates, dry_run, merge },
+        { holdMemory, addRingComment }
+      );
       log("info", "tool", {
         tool: "memory_import_candidate_commit",
         args: { candidate_count: Array.isArray(candidates) ? candidates.length : 0, dry_run, merge },
-        result: { committed_count: committed, skipped_count: skipped },
+        result: { committed_count: out.committed_count, skipped_count: out.skipped_count },
       });
+      const writable = out.results.length - out.skipped_count;
       const summary = dry_run
-        ? `dry_run：规划 ${plans.length} 条候选（未写入）。可写 ${plans.filter((p) => p.action !== "skip").length} 条，跳过 ${skipped} 条。`
-        : `提交完成：写入 ${committed} 条，跳过/失败 ${skipped} 条。`;
+        ? `dry_run：规划 ${out.results.length} 条候选（未写入）。可写 ${writable} 条，跳过 ${out.skipped_count} 条。`
+        : `提交完成：写入 ${out.committed_count} 条，跳过/失败 ${out.skipped_count} 条。`;
       return makeResult(out, summary);
     }
   );
@@ -4662,6 +4586,8 @@ app.options("/api/memories", (req, res) => res.sendStatus(204));
 app.options("/api/memories/:id", (req, res) => res.sendStatus(204));
 app.options("/api/memories/:id/restore", (req, res) => res.sendStatus(204));
 app.options("/api/memories/:id/permanent", (req, res) => res.sendStatus(204));
+app.options("/api/import/candidates/extract", (req, res) => res.sendStatus(204));
+app.options("/api/import/candidates/commit", (req, res) => res.sendStatus(204));
 
 app.get("/api/memories", requireFrontendAuth, async (req, res) => {
   try {
@@ -4876,6 +4802,63 @@ app.post("/api/memories/:id/restore", requireFrontendAuth, async (req, res) => {
   } catch (err) {
     log("error", "api", { route: "POST /api/memories/:id/restore", message: err instanceof Error ? err.message : String(err) });
     res.status(500).json({ error: "Failed to restore memory" });
+  }
+});
+
+// ── 导入候选 REST wrapper ─────────────────────────────────────────────────────
+// 前端「导入候选」面板调用；与 MCP tools memory_import_candidate_extract /
+// _commit 共用同一份业务逻辑（extractCandidates / commitImportCandidates），不重写算法。
+
+app.post("/api/import/candidates/extract", requireFrontendAuth, async (req, res) => {
+  try {
+    const { text, source, profile, chunk_chars, max_candidates } = req.body ?? {};
+    if (typeof text !== "string" || !text.trim()) {
+      return res.status(400).json({ error: "text is required" });
+    }
+    // 与 MCP tool 一致的默认值；extractCandidates 内部再做 clamp。
+    const result = extractCandidates({
+      text,
+      source,
+      profile: profile ?? "shared",
+      chunk_chars: chunk_chars ?? 6000,
+      max_candidates: max_candidates ?? 50,
+    });
+    log("info", "api", {
+      route: "POST /api/import/candidates/extract",
+      chunk_count: result.chunk_count,
+      candidate_count: result.candidate_count,
+    });
+    res.json(result);
+  } catch (err) {
+    log("error", "api", { route: "POST /api/import/candidates/extract", message: err instanceof Error ? err.message : String(err) });
+    res.status(500).json({ error: "Failed to extract candidates" });
+  }
+});
+
+app.post("/api/import/candidates/commit", requireFrontendAuth, async (req, res) => {
+  try {
+    const body = req.body ?? {};
+    if (!Array.isArray(body.candidates)) {
+      return res.status(400).json({ error: "candidates must be an array" });
+    }
+    // fail-safe：只有显式 false 才关闭 dry_run / merge，其余一律保持默认 true，
+    // 避免畸形输入意外触发写库。
+    const dry_run = body.dry_run !== false;
+    const merge = body.merge !== false;
+    const out = await commitImportCandidates(
+      { candidates: body.candidates, dry_run, merge },
+      { holdMemory, addRingComment }
+    );
+    log("info", "api", {
+      route: "POST /api/import/candidates/commit",
+      dry_run,
+      committed_count: out.committed_count,
+      skipped_count: out.skipped_count,
+    });
+    res.json(out);
+  } catch (err) {
+    log("error", "api", { route: "POST /api/import/candidates/commit", message: err instanceof Error ? err.message : String(err) });
+    res.status(500).json({ error: "Failed to commit candidates" });
   }
 });
 

@@ -117,4 +117,102 @@ export function planCommit(candidates = []) {
   }));
 }
 
+/**
+ * 执行整批候选的提交（dry_run 规划 + 真正写入的统一编排）。
+ *
+ * 写库动作通过注入的 holdMemory / addRingComment 完成——本文件不直接依赖数据库，
+ * 既便于单测注入 mock，也让 MCP tool 与 REST endpoint 共用同一份编排逻辑，避免两边漂移。
+ *
+ * - dry_run=true（默认）：只规划、绝不写库。
+ * - dry_run=false：才真正写入；单条失败（error）不影响后续候选。
+ * - kind=ignore / content 为空 → invalid；comment 缺合法 target_memory_id → needs_target。
+ *
+ * @param {{candidates?: any[], dry_run?: boolean, merge?: boolean}} input
+ * @param {{holdMemory: Function, addRingComment: Function}} deps
+ * @returns {Promise<{dry_run: boolean, committed_count: number, skipped_count: number, results: any[]}>}
+ */
+export async function commitImportCandidates(
+  { candidates = [], dry_run = true, merge = true } = {},
+  { holdMemory, addRingComment } = {}
+) {
+  const list = Array.isArray(candidates) ? candidates : [];
+  const plans = planCommit(list);
+  const results = [];
+  let committed = 0;
+  let skipped = 0;
+
+  for (const plan of plans) {
+    const base = { index: plan.index, kind: plan.kind ?? "" };
+
+    // 规划阶段就已判定无法写入（invalid / needs_target）。
+    if (plan.action === "skip") {
+      results.push({ ...base, status: plan.status, message: plan.message });
+      skipped++;
+      continue;
+    }
+
+    // dry_run：只返回会执行什么，不写库。
+    if (dry_run) {
+      const extra = {};
+      if (plan.action === "comment") extra.memory_id = plan.comment.memory_id;
+      results.push({ ...base, status: plan.status, message: plan.message, ...extra });
+      continue;
+    }
+
+    // 真正写入。单条失败不影响后续。
+    try {
+      if (plan.action === "comment") {
+        const cand = list[plan.index];
+        const { comment, comment_count } = await addRingComment({
+          memory_id: plan.comment.memory_id,
+          content: plan.comment.content,
+          author: plan.comment.author,
+          source: plan.comment.source || cand?.source,
+        });
+        results.push({
+          ...base,
+          status: "commented",
+          memory_id: plan.comment.memory_id,
+          comment_id: comment.id,
+          message: `已追加年轮 comment（id=${comment.id}），目标记忆现有 ${comment_count} 条。`,
+        });
+        committed++;
+      } else {
+        // hold：附带导入溯源信息进 raw。
+        const cand = list[plan.index];
+        const holdResult = await holdMemory({
+          ...plan.hold,
+          merge,
+          raw: {
+            import_source: cand?.source ?? "",
+            import_confidence: typeof cand?.confidence === "number" ? cand.confidence : null,
+            import_kind: plan.kind,
+            import_committed_at: new Date().toISOString(),
+          },
+        });
+        const item = holdResult.item;
+        results.push({
+          ...base,
+          status: holdResult.mode, // "created" | "merged"
+          memory_id: item?.id,
+          message:
+            holdResult.mode === "merged"
+              ? `已合并进已有记忆（id=${item?.id}，similarity=${holdResult.similarity}）。`
+              : `已新建记忆（id=${item?.id}，layer=${plan.layer}）。`,
+        });
+        committed++;
+      }
+    } catch (err) {
+      results.push({
+        ...base,
+        status: "error",
+        message: err instanceof Error ? err.message : String(err),
+      });
+      skipped++;
+    }
+  }
+
+  return { dry_run, committed_count: committed, skipped_count: skipped, results };
+}
+
 export default planCommit;
